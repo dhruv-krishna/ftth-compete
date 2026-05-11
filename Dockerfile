@@ -33,8 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # HF Spaces runs the container as user 1000 by default. We have to
-# match that for filesystem writes to work.
-RUN useradd -m -u 1000 user
+# match that for filesystem writes to work. Pre-create the working
+# directory with `user` ownership — WORKDIR alone would make it
+# root-owned and Reflex can't create .web/ at runtime.
+RUN useradd -m -u 1000 user && mkdir -p /home/user/app && chown user:user /home/user/app
 WORKDIR /home/user/app
 
 # Copy dependency manifests first so Docker layer-cache speeds up rebuilds.
