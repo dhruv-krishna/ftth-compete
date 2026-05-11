@@ -73,6 +73,14 @@ EXPOSE 7860
 # somewhere persistent within the container's lifetime.
 ENV FTTH_DATA_DIR=/home/user/app/data
 
-# Drop privileges + launch.
+# Drop privileges + launch. Reflex 0.9 in `--env prod` mode runs ONLY the
+# frontend by default (it's expected to be paired with a separately-run
+# backend, the cloud-deploy pattern). So we start both explicitly:
+# backend in background, frontend in foreground (via exec so SIGTERM
+# propagates when HF stops the container). Caddy on :7860 fans both.
 USER user
-CMD ["bash", "-lc", "caddy start --config /home/user/app/Caddyfile && uv run reflex run --env prod --loglevel info"]
+CMD ["bash", "-lc", "\
+    caddy start --config /home/user/app/Caddyfile && \
+    uv run reflex run --env prod --backend-only --loglevel info & \
+    exec uv run reflex run --env prod --frontend-only --loglevel info \
+"]
