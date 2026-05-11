@@ -21,7 +21,7 @@
         header Upgrade websocket
     }
     handle @websocket {
-        reverse_proxy localhost:8000 {
+        reverse_proxy 127.0.0.1:8000 {
             header_up Host {host}
             header_up X-Real-IP {remote_host}
             header_up X-Forwarded-For {remote_host}
@@ -32,11 +32,11 @@
     # Non-WS backend endpoints (health checks + the Plotly HTML iframes).
     @backend path /_event /_event/* /_health /ping /v2_map_html* /provider_map_html*
     handle @backend {
-        reverse_proxy localhost:8000
+        reverse_proxy 127.0.0.1:8000
     }
 
     # Frontend (Next.js export served by Reflex prod-mode static server).
     handle {
-        reverse_proxy localhost:3000
+        reverse_proxy 127.0.0.1:3000
     }
 }
