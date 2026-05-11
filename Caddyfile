@@ -1,8 +1,11 @@
 # Caddy reverse proxy fronting Reflex's two ports on HF Spaces.
 # HF exposes :7860 to the public; we route by path:
-#   - Reflex backend endpoints (/_event WebSocket, /_health, /ping,
-#     /v2_map_html, /provider_map_html) → :8000
-#   - Everything else (HTML, JS, CSS, Next.js static export)        → :3000
+#   - WebSocket on /_event → backend :8000 (with explicit WS upgrade
+#     headers; Caddy 2 auto-handles WS but being explicit avoids edge
+#     cases when the path matcher kicks in after a long URL).
+#   - Other backend HTTP endpoints (/_health, /ping, our Plotly HTML
+#     endpoints /v2_map_html, /provider_map_html) → :8000
+#   - Everything else (HTML/JS/CSS bundle) → frontend :3000
 
 :7860 {
     log {
@@ -11,13 +14,28 @@
         level INFO
     }
 
-    # WebSocket and backend HTTP endpoints
+    # WebSocket — explicit upgrade headers.
+    @websocket {
+        path /_event /_event/*
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    handle @websocket {
+        reverse_proxy localhost:8000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Non-WS backend endpoints (health checks + the Plotly HTML iframes).
     @backend path /_event /_event/* /_health /ping /v2_map_html* /provider_map_html*
     handle @backend {
         reverse_proxy localhost:8000
     }
 
-    # Frontend (Next.js export served by Reflex prod-mode static server)
+    # Frontend (Next.js export served by Reflex prod-mode static server).
     handle {
         reverse_proxy localhost:3000
     }

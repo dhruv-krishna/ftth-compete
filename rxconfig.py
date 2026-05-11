@@ -35,6 +35,10 @@ config = rx.Config(
     # the backend in --backend-only mode and rejects --frontend-port,
     # crashing the container in a loop. The defaults (3000 / 8000) are
     # the same as what we'd hardcode and work for local dev too.
+    # Allow WS connections from the HF Spaces public hostname (and any
+    # other origin you'd deploy under). Wildcard is fine for personal
+    # use on a public read-only demo.
+    cors_allowed_origins=["*"],
     plugins=[
         SitemapPlugin(),
         RadixThemesPlugin(theme=_theme),
