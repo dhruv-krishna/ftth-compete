@@ -532,9 +532,12 @@ class LookupState(rx.State):
             "state": self.state,
             "layer": effective_layer,
         })
-        # Reflex serves backend at :8000; frontend at :3000. Use absolute
-        # URL to the backend so the iframe loads the actual endpoint.
-        return f"http://localhost:8000/v2_map_html?{params}"
+        # Relative URL — Caddy / the dev backend serves /v2_map_html on
+        # the same origin as the frontend, so a relative path Just Works
+        # locally (Reflex's dev frontend on :3000 proxies /v2_map_html
+        # to :8000) AND in cloud (Caddy on :7860 routes /v2_map_html*
+        # to :8000). Hardcoding localhost broke the cloud deploy.
+        return f"/v2_map_html?{params}"
 
     @rx.var(cache=True)
     def v2_figure(self) -> go.Figure:
@@ -6076,7 +6079,8 @@ class ProviderViewState(rx.State):
         """Backend URL for the national-footprint iframe."""
         if not self.detail_slug:
             return ""
-        return f"http://localhost:8000/provider_map_html?slug={self.detail_slug}"
+        # Relative URL — same reasoning as v2_map_iframe_url above.
+        return f"/provider_map_html?slug={self.detail_slug}"
 
     @rx.event(background=True)
     async def prewarm_trajectory(self):
