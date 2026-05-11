@@ -101,6 +101,11 @@ class LookupState(rx.State):
     # momentum data..." indicator near velocity / sparklines.
     momentum_loading: bool = False
     momentum_note: str = ""
+    # Enrichment (IAS take-rate anchor, Ookla measured speeds, Google
+    # ratings) is loaded as a follow-up after the fast base lookup so
+    # KPIs + provider list paint immediately. True while that fetch is
+    # in flight; nav-bar shows a "Loading data..." spinner.
+    enrich_loading: bool = False
 
     # Strategic lens / UI state ------------------------------------------
     lens: str = "neutral"
@@ -869,13 +874,22 @@ class LookupState(rx.State):
     async def run_lookup(self):
         """Run `pipeline.run_market()` off-thread; populate result fields.
 
-        Two-phase progressive load. **Phase A** (this method) runs the
-        base lookup without velocity / trajectory — that gets the user
-        a populated market in ~30-90s instead of ~5-20 minutes when the
-        prior BDC release parquets aren't cached. Once the main result
-        is painted, we yield `backfill_momentum` which fetches the
-        previous BDC release + trajectory snapshots and merges the
-        velocity / sparkline data into the existing rows.
+        Three-phase progressive load:
+
+        **A1 — fast base** (~30-50s cold): TIGER + ACS + BDC providers +
+        housing + heuristic penetration. Skips IAS / Ookla / Places.
+        Paints KPIs, provider list, fiber availability.
+
+        **A2 — enrichment** (~10-20s after A1, since BDC/ACS are warm):
+        IAS take-rate anchor + Ookla measured speeds + Google ratings.
+        Fills the take-rate panel, speeds strip, rating badges.
+
+        **B — momentum** (~5-10min cold, near-instant warm): velocity +
+        trajectory + subscription history. Fills sparklines + 12-month
+        delta highlights.
+
+        Each phase paints incrementally so the user sees something
+        useful within ~30-50s instead of waiting ~60-90s for the lot.
         """
         # Snapshot the form inputs and clear prior state.
         async with self:
@@ -890,20 +904,22 @@ class LookupState(rx.State):
             self.progress_label = "Resolving market..."
             self.momentum_loading = False
             self.momentum_note = ""
+            self.enrich_loading = False
             include_boundary = self.include_boundary
             no_speeds = self.no_speeds
             no_ratings = self.no_ratings
             wants_momentum = self.include_velocity or self.include_trajectory
 
         try:
-            # Phase A: fast lookup, no velocity / no trajectory.
-            sheet = await asyncio.to_thread(
+            # Phase A1: fast base — skip IAS / speeds / ratings.
+            sheet_fast = await asyncio.to_thread(
                 run_market,
                 city,
                 state,
                 include_boundary=include_boundary,
-                no_speeds=no_speeds,
-                no_ratings=no_ratings,
+                no_speeds=True,
+                no_ratings=True,
+                no_ias=True,
                 include_velocity=False,
                 include_trajectory=False,
             )
@@ -919,12 +935,41 @@ class LookupState(rx.State):
                 self.lookup_error = f"Lookup failed: {exc}"
             return
 
-        # Populate result fields atomically.
+        # Paint Phase A1: KPIs + providers + housing now visible.
         async with self:
-            _populate_from_sheet(self, sheet)
+            _populate_from_sheet(self, sheet_fast)
             self.is_loading = False
             self.has_result = True
             self.progress_label = ""
+            # Enrichment fires next; momentum waits until enrichment ends
+            # so the two progress indicators don't pile on top of each other.
+            self.enrich_loading = True
+
+        # Phase A2: enrichment. Re-runs run_market with IAS / speeds /
+        # ratings turned on. BDC/ACS/TIGER are disk-warm so this stage
+        # only pays for the new I/O.
+        try:
+            sheet_full = await asyncio.to_thread(
+                run_market,
+                city,
+                state,
+                include_boundary=include_boundary,
+                no_speeds=no_speeds,
+                no_ratings=no_ratings,
+                include_velocity=False,
+                include_trajectory=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Enrichment lookup failed")
+            async with self:
+                self.enrich_loading = False
+            # Non-fatal: leave A1 results in place; A2-only fields stay "—".
+        else:
+            async with self:
+                _populate_from_sheet(self, sheet_full)
+                self.enrich_loading = False
+
+        async with self:
             self.momentum_loading = wants_momentum
             self.momentum_note = (
                 "Fetching prior BDC releases..."
@@ -932,10 +977,7 @@ class LookupState(rx.State):
                 else ""
             )
 
-        # Phase B: kick off the momentum backfill as a follow-up event so
-        # the UI can paint Phase A's results immediately. The yield hands
-        # control back to Reflex's event loop; `backfill_momentum` runs
-        # next (also background) and updates the rows in place.
+        # Phase B: kick off the momentum backfill as a follow-up event.
         if wants_momentum:
             yield LookupState.backfill_momentum
 
@@ -4982,6 +5024,18 @@ def _v2_top_strip() -> rx.Component:
             ),
         ),
         rx.spacer(),
+        rx.cond(
+            LookupState.enrich_loading,
+            rx.hstack(
+                rx.spinner(size="1"),
+                rx.text(
+                    "Loading map and data...",
+                    size="1", color_scheme="gray",
+                ),
+                spacing="2",
+                align="center",
+            ),
+        ),
         rx.cond(
             LookupState.momentum_loading,
             rx.hstack(
