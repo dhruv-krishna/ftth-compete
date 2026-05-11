@@ -29,6 +29,7 @@ from ftth_compete.ui.narrative import (
     fiber_share,
     market_narrative,
 )
+from ftth_compete_web import analytics
 
 log = logging.getLogger(__name__)
 
@@ -300,9 +301,47 @@ class LookupState(rx.State):
             if s:
                 self.state = s
 
+    # Analytics helper — best-effort, swallows errors. Records the
+    # caller's event with stable session token + hashed visitor IP (from
+    # X-Forwarded-For when behind Caddy/HF). Never raises so a logger
+    # outage can't break a state event.
+    def _track(self, kind: str, payload: dict | None = None) -> None:
+        try:
+            session_id = None
+            ip = None
+            ua = None
+            try:
+                sess = getattr(self.router, "session", None)
+                if sess is not None:
+                    tok = getattr(sess, "client_token", None) or getattr(sess, "session_id", None)
+                    if tok:
+                        session_id = str(tok)
+            except Exception:
+                pass
+            try:
+                headers = getattr(self.router, "headers", None)
+                if headers is not None:
+                    xff = (
+                        getattr(headers, "x_forwarded_for", None)
+                        or getattr(headers, "host", None)
+                    )
+                    if xff:
+                        # X-Forwarded-For may be comma-separated; first IP is client.
+                        ip = str(xff).split(",")[0].strip()
+                    ua = getattr(headers, "user_agent", None) or ""
+            except Exception:
+                pass
+            analytics.record(
+                kind, payload or {},
+                session_id=session_id, ip=ip, ua=ua,
+            )
+        except Exception:
+            pass  # analytics never breaks the app
+
     @rx.event
     def set_active_tab(self, tab: str) -> None:
         self.active_tab = tab
+        self._track("tab", {"tab": tab})
 
     @rx.event
     def set_city(self, value: str) -> None:
@@ -337,11 +376,13 @@ class LookupState(rx.State):
         label_to_key = {label: key for label, key in LENS_OPTIONS}
         self.lens = label_to_key.get(value, "neutral")
         self._recompute_visible_providers()
+        self._track("lens", {"lens": self.lens})
 
     @rx.event
     def set_incumbent(self, value: str) -> None:
         self.incumbent = value
         self._recompute_visible_providers()
+        self._track("incumbent", {"incumbent": value})
 
     # Competitors filter setters --------------------------------------
     @rx.event
@@ -372,6 +413,7 @@ class LookupState(rx.State):
     def select_tract(self, geoid: str) -> None:
         self.selected_tract = geoid
         self.selected_provider = ""
+        self._track("tract_click", {"geoid": geoid, "market": self.market_title})
 
     @rx.event
     def select_provider(self, name: str) -> None:
@@ -386,6 +428,7 @@ class LookupState(rx.State):
         if name in (self.footprint_provider_options or []):
             self.footprint_provider = name
             self.footprint_search = ""
+        self._track("provider_click", {"name": name, "market": self.market_title})
 
     @rx.event
     def clear_selection(self) -> None:
@@ -909,6 +952,9 @@ class LookupState(rx.State):
             no_speeds = self.no_speeds
             no_ratings = self.no_ratings
             wants_momentum = self.include_velocity or self.include_trajectory
+            self._track("market_lookup", {
+                "city": city, "state": state, "lens": self.lens,
+            })
 
         try:
             # Phase A1: fast base — skip IAS / speeds / ratings.
@@ -7019,3 +7065,107 @@ try:
     )
 except Exception as exc:  # noqa: BLE001
     print(f"[ftth_compete_web] FAILED to register /provider_map_html: {exc!r}")
+
+
+# ---------------------------------------------------------------------------
+# Admin sidecar — private visitor/event log.
+#
+# Gated by `?key=<ADMIN_KEY>` matching the `ADMIN_KEY` env var. Wrong /
+# missing key returns 404 so the route is indistinguishable from "no
+# such route" to anonymous visitors. Without `ADMIN_KEY` set the route
+# is permanently disabled (always 404).
+
+import html as _html  # local alias to avoid clobbering any `html` name
+import os as _os
+
+
+def _render_admin_html() -> str:
+    summary = analytics.summary()
+    events = analytics.recent(limit=300)
+
+    def _esc(v) -> str:
+        return _html.escape(str(v if v is not None else ""))
+
+    rows_html = "".join(
+        f"<tr>"
+        f"<td class='nowrap'>{_esc(e['ts'])}</td>"
+        f"<td class='nowrap'>{_esc((e['session_id'] or '')[:8])}</td>"
+        f"<td class='nowrap'>{_esc(e['ip_hash'] or '')}</td>"
+        f"<td>{_esc(e['kind'])}</td>"
+        f"<td><code>{_esc((e['payload'] or '')[:300])}</code></td>"
+        f"<td class='ua'>{_esc((e['ua'] or '')[:80])}</td>"
+        f"</tr>"
+        for e in events
+    )
+    by_kind = ", ".join(
+        f"{_esc(k)}: {n}" for k, n in summary["by_kind_today"]
+    ) or "(none)"
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>ftth-compete · admin</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;padding:20px;color:#222;background:#fafafa;margin:0;}}
+h1{{font-size:18px;margin:0 0 12px 0;}}
+.summary{{background:white;padding:14px 18px;border:1px solid #ddd;margin-bottom:14px;border-radius:6px;}}
+.summary div{{margin:3px 0;font-size:14px;}}
+.summary strong{{display:inline-block;min-width:200px;color:#444;}}
+table{{border-collapse:collapse;width:100%;font-size:13px;background:white;}}
+th,td{{border:1px solid #ddd;padding:6px 10px;text-align:left;vertical-align:top;}}
+th{{background:#eee;font-weight:600;position:sticky;top:0;}}
+tr:nth-child(even){{background:#f7f7f7;}}
+code{{font-size:12px;color:#555;font-family:ui-monospace,Menlo,Consolas,monospace;}}
+.nowrap{{white-space:nowrap;}}
+.ua{{color:#888;font-size:11px;max-width:240px;overflow:hidden;text-overflow:ellipsis;}}
+.muted{{color:#777;font-size:12px;margin-top:6px;}}
+</style></head>
+<body>
+<h1>ftth-compete · admin sidecar</h1>
+<div class="summary">
+  <div><strong>Sessions today (UTC)</strong> {summary['sessions_today']}</div>
+  <div><strong>Distinct IPs today</strong> {summary['unique_ips_today']}</div>
+  <div><strong>Total events (all time)</strong> {summary['total_events']}</div>
+  <div><strong>Events today by kind</strong> {by_kind}</div>
+  <div class="muted">
+    Storage is ephemeral on HF Spaces free tier — wipes on container restart.
+    IPs are stored as an 8-char SHA-256 prefix, not raw.
+  </div>
+</div>
+<table>
+  <thead><tr>
+    <th>UTC timestamp</th>
+    <th>Session</th>
+    <th>IP hash</th>
+    <th>Event</th>
+    <th>Payload</th>
+    <th>User-Agent</th>
+  </tr></thead>
+  <tbody>
+    {rows_html or '<tr><td colspan="6" class="muted">No events yet.</td></tr>'}
+  </tbody>
+</table>
+</body></html>"""
+
+
+async def _serve_admin(request: Request) -> Response:
+    """GET /admin?key=<ADMIN_KEY>
+
+    Wrong or missing key returns 404 (indistinguishable from "no such
+    route"). If ADMIN_KEY env var is unset, the route is disabled
+    entirely — same 404 response.
+    """
+    expected = _os.environ.get("ADMIN_KEY", "").strip()
+    given = (request.query_params.get("key", "") or "").strip()
+    if not expected or given != expected:
+        return Response(
+            content="<html><body>Not found.</body></html>",
+            media_type="text/html",
+            status_code=404,
+        )
+    return Response(content=_render_admin_html(), media_type="text/html")
+
+
+try:
+    app._api.add_route("/admin", _serve_admin, methods=["GET"])
+    print("[ftth_compete_web] Registered admin sidecar at /admin")
+except Exception as exc:  # noqa: BLE001
+    print(f"[ftth_compete_web] FAILED to register /admin: {exc!r}")
