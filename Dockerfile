@@ -53,10 +53,11 @@ COPY --chown=user:user Caddyfile ./
 # LFS). cloud_seed.py no-ops when data/seed/ is missing, so removing
 # the COPY is safe.
 
-# `reflex export` builds the static frontend bundle into .web/. Skipping
-# `reflex init` because the app is already initialized (rxconfig.py +
-# ftth_compete_web/ exist in the repo); init is for scaffolding new apps.
-RUN uv run reflex export --frontend-only --no-zip --loglevel info
+# NOTE: we don't run `reflex export` at build time. The first invocation
+# of `reflex run` at container startup does the .web/ scaffold + frontend
+# build, and we get real-time logs if it errors. This costs ~2-3 min on
+# first container start (subsequent starts reuse the built .web/), but
+# avoids the opaque build-time failures we hit otherwise.
 
 # HF Spaces expects port 7860.
 ENV PORT=7860
@@ -69,4 +70,4 @@ ENV FTTH_DATA_DIR=/home/user/app/data
 
 # Drop privileges + launch.
 USER user
-CMD ["bash", "-lc", "caddy start --config /home/user/app/Caddyfile && uv run reflex run --env prod --backend-only --loglevel info"]
+CMD ["bash", "-lc", "caddy start --config /home/user/app/Caddyfile && uv run reflex run --env prod --loglevel info"]
