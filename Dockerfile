@@ -46,9 +46,12 @@ RUN uv sync --no-dev
 # Copy app sources after deps so code edits don't bust the deps layer.
 COPY --chown=user:user src/ ./src/
 COPY --chown=user:user ftth_compete_web/ ./ftth_compete_web/
-COPY --chown=user:user data/seed/ ./data/seed/
 COPY --chown=user:user rxconfig.py ./
 COPY --chown=user:user Caddyfile ./
+# data/seed/ would be copied here if it existed, but the seed parquet
+# is currently held out of git (HF Spaces blocks binary files without
+# LFS). cloud_seed.py no-ops when data/seed/ is missing, so removing
+# the COPY is safe.
 
 # Reflex's `init` writes the .web/ dir (Next.js scaffold). `export`
 # builds the static frontend bundle. Both need network access for npm,
