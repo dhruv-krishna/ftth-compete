@@ -7,7 +7,7 @@ sdk: docker
 app_port: 7860
 pinned: false
 license: other
-short_description: FTTH market competitive intelligence (personal, non-commercial)
+short_description: FTTH competitive intelligence (personal, non-commercial)
 ---
 
 # ftth-compete
