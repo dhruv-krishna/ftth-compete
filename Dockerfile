@@ -16,7 +16,7 @@ FROM python:3.12-slim
 #   - gosu: drop to non-root user at runtime (HF Spaces best practice)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates debian-keyring debian-archive-keyring \
-        apt-transport-https build-essential gnupg \
+        apt-transport-https build-essential gnupg unzip \
     && curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
         | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
     && curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
