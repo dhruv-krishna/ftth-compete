@@ -1,0 +1,78 @@
+[project]
+name = "ftth-compete"
+version = "0.1.0"
+description = "FTTH competitive intelligence — single-input city/state market tear-sheet"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Personal / non-commercial" }
+authors = [{ name = "Dhruv Krishna" }]
+
+dependencies = [
+    "streamlit>=1.39",
+    "duckdb>=1.1",
+    "polars>=1.12",
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "pyarrow>=18.0",
+    "folium>=0.18",
+    "streamlit-folium>=0.23",
+    "httpx>=0.28",
+    "tenacity>=9.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "click>=8.1",
+    "rich>=13.9",
+    "platformdirs>=4.3",
+    "matplotlib>=3.9",
+    "plotly>=5.24",
+    "truststore>=0.10",
+    "reportlab>=4.2",
+    "reflex>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pytest-mock>=3.14",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "types-requests",
+]
+
+[project.scripts]
+ftth-compete = "ftth_compete.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ftth_compete"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pytest-mock>=3.14",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true

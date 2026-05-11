@@ -1,0 +1,60 @@
+assets/external/
+.states
+.web
+*.db
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Envs
+.venv/
+.env
+.env.cloud
+.env.*.local
+
+# Project data — large bulk downloads, not committed
+data/raw/
+data/processed/
+data/cache.db
+data/cache.db-*
+*.parquet
+# Exception: slim seed parquets for the cloud demo's cold start. NOT
+# currently in use — Hugging Face Spaces rejects binary files without
+# Git LFS setup. Re-enable + add `.gitattributes` LFS tracking if you
+# want pre-warmed /providers + /screener on cloud cold start. The
+# cloud_seed module is harmless to keep around either way.
+# !data/seed/
+# !data/seed/**/*.parquet
+# !data/seed/**/*.meta
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+*.egg
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs (FCC API URLs sometimes contain hash_value tokens — never commit)
+*.log
+
+# Generated artifacts / debug dumps
+exports/
+scripts/_v2_map_test.html
+evans_*.json
+*_tearsheet.json
+*_tearsheet.pdf
+
+# uv lockfile is fine to commit, but exclude any local override
+.python-version

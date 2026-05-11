@@ -1,0 +1,24 @@
+# Caddy reverse proxy fronting Reflex's two ports on HF Spaces.
+# HF exposes :7860 to the public; we route by path:
+#   - Reflex backend endpoints (/_event WebSocket, /_health, /ping,
+#     /v2_map_html, /provider_map_html) → :8000
+#   - Everything else (HTML, JS, CSS, Next.js static export)        → :3000
+
+:7860 {
+    log {
+        output stderr
+        format console
+        level INFO
+    }
+
+    # WebSocket and backend HTTP endpoints
+    @backend path /_event /_event/* /_health /ping /v2_map_html* /provider_map_html*
+    handle @backend {
+        reverse_proxy localhost:8000
+    }
+
+    # Frontend (Next.js export served by Reflex prod-mode static server)
+    handle {
+        reverse_proxy localhost:3000
+    }
+}

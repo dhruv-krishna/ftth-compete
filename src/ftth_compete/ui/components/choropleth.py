@@ -1,0 +1,1 @@
+"""Folium choropleth widget wrapper."""
