@@ -26,10 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         caddy nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv (fast, no network surprises since uv is a single binary).
-ADD https://astral.sh/uv/install.sh /uv-installer.sh
-RUN sh /uv-installer.sh && rm /uv-installer.sh
-ENV PATH="/root/.local/bin:${PATH}"
+# Install uv to a system-wide location. The default install script
+# drops it under /root/.local/bin which isn't readable by the non-root
+# `user` (uid 1000) we drop privileges to at runtime. Copying from
+# Astral's official uv image is the cleanest path.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # HF Spaces runs the container as user 1000 by default. We have to
 # match that for filesystem writes to work.
@@ -41,7 +42,9 @@ COPY --chown=user:user pyproject.toml ./
 COPY --chown=user:user README.md ./
 
 # Install Python deps. --no-dev skips pytest/ruff/mypy — saves ~200MB.
-RUN uv sync --no-dev
+# Runs as root then chowns the venv to user so the runtime `user`
+# (uid 1000) can read it after we drop privileges at the bottom.
+RUN uv sync --no-dev && chown -R user:user /home/user/app/.venv
 
 # Copy app sources after deps so code edits don't bust the deps layer.
 COPY --chown=user:user src/ ./src/
