@@ -53,11 +53,10 @@ COPY --chown=user:user Caddyfile ./
 # LFS). cloud_seed.py no-ops when data/seed/ is missing, so removing
 # the COPY is safe.
 
-# Reflex's `init` writes the .web/ dir (Next.js scaffold). `export`
-# builds the static frontend bundle. Both need network access for npm,
-# which HF Spaces' build runner has.
-RUN uv run reflex init --template blank --loglevel error || true \
-    && uv run reflex export --frontend-only --no-zip --loglevel error
+# `reflex export` builds the static frontend bundle into .web/. Skipping
+# `reflex init` because the app is already initialized (rxconfig.py +
+# ftth_compete_web/ exist in the repo); init is for scaffolding new apps.
+RUN uv run reflex export --frontend-only --no-zip --loglevel info
 
 # HF Spaces expects port 7860.
 ENV PORT=7860
