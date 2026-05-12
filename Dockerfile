@@ -128,7 +128,7 @@ RUN mkdir -p /home/user/app/data/raw/tiger/2024/ZCTA_TRACT_REL && \
 # uid 1000 runtime user can read it.
 RUN uv run reflex init --loglevel info \
     && uv run reflex export --frontend-only --no-zip --loglevel info \
-    && chown -R user:user /home/user/app/.web
+    && chown -R user:user /home/user/app
 
 # HF Spaces expects port 7860.
 ENV PORT=7860
