@@ -1,93 +1,85 @@
 # UX specification
 
-Single Streamlit app, sidebar + four tabs.
+Multi-page Reflex app. The canonical entry point is `/v2` (single-market deep-dive); `/screener`, `/providers`, `/provider/<slug>` are sibling routes that compose the same cached data into different shapes.
 
-## Sidebar
+## `/v2` — Market deep-dive
 
-- **City + State input** — text + state dropdown (50 states + DC + PR).
-- **Lens selector** — radio: ⚔️ Defensive / 🚀 Offensive / ⚖️ Neutral. Default: Neutral.
-- **Incumbent dropdown** — only shown when Defensive lens is active. Populated from canonical providers in current market.
-- **Refresh button** — re-runs the pipeline ignoring cache for the current market.
-- **Export** — buttons for "Download PDF tear-sheet" and "Download CSV bundle".
+Three-panel layout (sticky 56px nav bar on top, then left rail / center canvas / right rail).
+
+### Left rail (260px, sticky)
+
+- **City + State input** — text + state dropdown (50 states + DC + PR). Quick-pick presets row above the input (Evans CO / Plano TX / Brooklyn NY / Manhattan NY / Queens NY / Mountain View CA / Kansas City Metro MO).
+- **Advanced options accordion** — include-boundary tracts, skip-Ookla, skip-Google-ratings, include-velocity, include-trajectory checkboxes.
+- **Look-up button** — kicks off `LookupState.run_lookup`. Disabled while a lookup is in flight.
+- **Lens selector** — radio: Defensive / Offensive / Neutral. Default: Neutral.
+- **Incumbent dropdown** — only shown when Defensive lens is active. Populated from canonical providers in the current market.
 - **Footer**:
-  - Data version row: "BDC: Dec 2024 · ACS5: 2020–2024 · IAS: Jun 2025 · Refreshed: <local date>"
-  - Ookla attribution: "Speed test data © Ookla, 2019–present, distributed under CC BY-NC-SA 4.0"
+  - Data version row showing each source's resolved release ("BDC: <release> · ACS5: <vintage> · IAS: <release> · Ookla: latest").
+  - Ookla attribution: "Speed test data © Ookla, 2019–present, distributed under CC BY-NC-SA 4.0".
 
-## Tab 1 — Overview
+### Center canvas
 
-**KPI cards** (single row, 7 cards):
+Plotly choropleth iframe (`/v2_map_html?...` Starlette endpoint, cached per `(city, state, layer)` so layer-switches are sub-second after the first render). Layer dropdown above the map: fiber providers per tract, total providers, fiber/cable availability %, measured down/up/latency, MDU share, poverty rate, median HH income, ACP density, plus per-fiber-provider footprint layers (one per fiber ISP in the market).
 
-1. Population
-2. # Census tracts
-3. Poverty rate (with national avg context)
-4. Median HH income (with national avg context)
-5. MDU %
-6. # Active providers
-7. % addresses fiber-served
+Click a tract → right rail switches to **tract detail** view. Click a provider in the right rail → map auto-flips to that provider's footprint layer.
 
-**Generated narrative paragraph** (~3-5 sentences). Deterministic templating, no LLM in v1. Example:
+### Right rail (340px)
 
-> Evans, CO has a population of 21,847 across 6 census tracts, with a 17.2% poverty rate (vs 12.4% national) and median HH income of $54,310. Housing is 82% single-family, 18% multi-dwelling. 7 broadband providers serve the market, with 64% of addresses having access to fiber. Lumen and Allo Communications are the dominant fiber providers; Xfinity is the cable incumbent.
+Polymorphic context panel, three states:
+- **No selection** → market summary (KPIs + provider list + IAS take-rate anchor + measured speeds + velocity highlights + opportunity panel under offensive lens).
+- **Selected tract** → per-tract demographics + full provider list with tech badges.
+- **Selected provider** → coverage % / tracts / locations / max speeds / star rating / velocity badge / inline SVG trajectory sparkline / lens-score badge.
 
-**Mini-map thumbnail** — full map lives in Tab 3.
+### Six tabs
 
-## Tab 2 — Competitors
+The center-canvas tab bar exposes the same right-rail data plus deeper views:
 
-**Card grid view** (default), sortable by lens score.
+1. **Overview** — KPI grid, IAS subscription anchor, Ookla measured-speeds strip, 12-month velocity highlights, opportunity card (offensive lens only), narrative paragraph, take-rate trajectory sparkline + summary line, ACP density panel, tract-detail accordion.
+2. **Competitors** — color-coded lens banner, filter controls (sort, category chips, fiber-only toggle), summary KPI strip, segmented Cards / Table view. Provider cards have 3-col grid layout with category & tech badges, full-width coverage bar, 2-col metrics, 3-segment speed-tier mini-bar (gig+/100Mbps+/<100), color-coded star rating, subs estimate with confidence badge, velocity badge, inline SVG trajectory sparkline.
+3. **Housing** — 4-card summary strip (SFH share with national delta, MDU share with national delta, mobile/other, total units), MDU sub-row (small/mid/large), full 10-bucket B25024 horizontal bar chart, per-tract table with MDU-share progress bar.
+4. **Map** — Folium choropleth alternative to the Plotly center canvas. 10 selectable layers with branca color scales.
+5. **Compare** — Save current market button populates a Radix surface table comparing saved markets side-by-side. Lens-aware ranking.
+6. **Methodology** — Markdown-rendered doc page covering data sources, metrics, penetration math, velocity, lens scoring, limitations, attributions.
 
-Each card:
-- Provider logo (cached locally) + canonical name
-- Tech badges (Fiber 50 / Cable 40 / FW 71-72)
-- Coverage %: portion of tracts where provider serves any address
-- Estimated subscribers: range "low–high (mid)" with confidence label
-- Speed: "Advertised: 1000/500 · Measured (median): 410/220"
-  - Show speed-gap visual if gap_pct > 30%
-- Google rating: stars + review count, color-coded (green ≥4, yellow 3-4, red <3)
-- 12-month coverage delta (expansion velocity)
+### Staged paint
 
-**Lens flags overlay:**
-- Defensive: red badge on fiber-equipped competitors of the selected incumbent
-- Offensive: green opportunity badge on low-rating or cable-only providers
+`run_lookup` paints in four phases so users see progress sooner. Spinner labels in the nav bar reflect the active phase:
 
-**Table view alternative** — same data, sortable spreadsheet-style. Toggle in tab header.
+- **A1** (no spinner; just the main loading state) — fast base: TIGER + ACS + BDC + housing + heuristic penetration. ~30-50s cold. Paints KPIs, provider list, fiber availability.
+- **A2** ("Loading map and data...") — enrichment: IAS anchor + Ookla speeds + Google ratings. ~10-20s after A1.
+- **B1** ("Loading momentum data...") — historical IAS subscription trajectory. ~30s warm.
+- **B2** (continues "Loading momentum data...") — velocity + trajectory across 1–4 BDC releases. ~5 min cold per state.
 
-## Tab 3 — Map
+## `/screener` — Batch market screener
 
-- **Folium choropleth** of tracts.
-- **Layer toggles** (left panel):
-  - Default: Competitor density (count of fiber providers per tract)
-  - Per-provider coverage layers
-  - Poverty rate
-  - MDU concentration
-  - Ookla measured median speed
-- **Click tract** → popup with:
-  - GEOID
-  - Population, MDU %
-  - Full per-tract provider list with tech tags
-  - Measured speed median + sample count
+Pick one or more states + filter ranges (MFI band, MDU share, fiber-availability %, population band). Returns a sortable opportunity-score table covering every Census PLACE in the selected state(s). CSV export. Per-row **Open** button deep-links to `/v2?city=X&state=Y&autorun=1`.
 
-## Tab 4 — Housing
+Disk-cached at `data/processed/screener/<release>__<states>.parquet`. Force Rebuild toggle bypasses cache.
 
-- **Stacked bar** of unit-type breakdown from B25024 (1u / 2-4u / 5-19u / 20-49u / 50+u).
-- **Cross-tab** housing type × fiber availability — heatmap.
-- **MDU concentration map** — small inset choropleth.
+## `/providers` — Provider directory
 
-## Creative additions
+Every canonical provider with a footprint in any cached BDC state parquet. Sortable by states served / tracts / fiber tracts / locations. Click a row → `/provider/<slug>`.
 
-- **Provider radar chart.** 4-axis spider: coverage / measured-speed / rating / penetration. One per provider, side-by-side comparable.
-- **Advertised-vs-measured speed gap chart.** Bar chart per provider with two bars (advertised, measured). Surfaces "promised but not delivered" providers visually.
-- **BDC sparkline per provider.** Small line chart on the provider card showing fiber coverage % across last 4 BDC releases. Tells the "who's expanding" story.
+## `/provider/<slug>` — Provider detail
+
+National state-level footprint choropleth (Plotly iframe at `/provider_map_html?slug=...`), per-state breakdown, head-to-head competitor overlap matrix, trajectory across cached BDC releases.
+
+## `/admin?key=<ADMIN_KEY>` — Private visitor log
+
+SQLite-backed event store rendered as an HTML table: timestamp, session id (first 8 chars), SHA-256-prefix-hashed IP, event kind, payload, user-agent. Wrong / missing key → 404. Storage is ephemeral on HF Spaces free tier; wipes on container restart.
 
 ## Copy guidelines
 
 - **Honest, not hedge-y.** "Estimated 30–55%" not "approximately around 30 to 55 percent perhaps."
-- **Surface caveats without burying.** Data lag and confidence labels are visible, not in tooltip-only.
+- **Surface caveats without burying.** Data-lag and confidence labels are visible, not tooltip-only.
 - **Avoid telecom jargon in headlines.** "Fiber-served addresses" not "BSL fiber availability."
 - **Numbers are formatted human-friendly.** "21,847" not "21847". "$54,310" not "54310".
 - **Ranges always shown lo–mid–hi.** Not "30%±25%" or "30% (CI: 5–55%)" — too clinical.
+- **No emojis in UI strings** (per user direction, Nov 2026). Use Radix icons or plain text.
 
 ## Performance targets
 
-- Cold lookup (uncached): ≤ 2 minutes.
-- Warm lookup (cached): ≤ 60 seconds.
-- Map render: ≤ 2 seconds for any market up to 200 tracts.
+- Cold market lookup (uncached): A1 paint ≤ 60s, A2 ≤ +30s, B1 ≤ +60s, B2 ≤ +5 min.
+- Warm market lookup: < 5s end-to-end.
+- Map iframe render: < 2s for any market up to 200 tracts (cached per layer, sub-second on subsequent layer switches).
+- Screener single-state cold: 2–15 min depending on PLACE count. Warm: < 1s (disk cache hit).

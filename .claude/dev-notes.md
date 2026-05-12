@@ -25,7 +25,7 @@ This is the running log of "we learned this the hard way." When something surpri
 - **GeoPandas requires GDAL/PROJ.** On Windows, install via `uv` works because uv ships pre-built wheels, but a manual pip install can fail. Always use `uv sync`.
 - **Reflex 0.9 background events.** State mutations from inside `@rx.event(background=True)` must be wrapped in `async with self:` blocks — those are what trigger a paint. Yielding another event handler (e.g. `yield LookupState.backfill_X`) chains the next phase; the user sees the previous phase's state in between. The `/v2` lookup uses this for A1 → A2 → B1 → B2 staging.
 - **Polars expression API is great** for joins but watch out for null handling — left joins default to keeping nulls, which can break downstream sums.
-- **Avoid em-dashes (—) in CLI strings.** PowerShell on Windows often renders them as `�` due to console code page. Use ASCII `-` in `click.echo` and other terminal output. Markdown / Streamlit / docs are unaffected.
+- **Avoid em-dashes (—) in CLI strings.** PowerShell on Windows often renders them as `�` due to console code page. Use ASCII `-` in `click.echo` and other terminal output. Markdown / Reflex UI / docs are unaffected.
 - **`uv run` + a stale `VIRTUAL_ENV` shell var** prints a benign warning each invocation. Harmless — uv ignores it because we set `UV_PROJECT_ENVIRONMENT`. Open a fresh PowerShell to silence.
 
 ## Pydantic-settings fixture pitfall

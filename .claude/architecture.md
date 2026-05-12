@@ -73,4 +73,4 @@
 ## Open architectural questions
 
 - Whether to make `analysis/` modules pure functions (current direction) or a stateful `MarketSnapshot` class. Currently leaning pure — easier to test, no hidden state.
-- Whether Streamlit's session_state is enough for caching warm market lookups across user clicks, or if we need a shared in-process cache layer.
+- Whether to pay for HF persistent storage ($5/mo) so the BDC / IAS / ACS caches survive container restarts. Today the IAS history is reseeded at Docker build time via `RUN curl` and BDC state parquets warm on demand. Persistent storage would make `/screener` re-runs and momentum lookups warm across deploys too.

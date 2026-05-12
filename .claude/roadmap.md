@@ -128,22 +128,33 @@ Each Competitor card has an expander "Per-tract detail (N tracts)" showing per-t
 `analysis/lenses.py` with 3 lens scoring functions + `market_opportunity()` for entrant-side composite scoring. Sidebar reactive lens selector (no re-fetch). When defensive: incumbent dropdown auto-defaults to local cable provider. Competitors tab shows lens banner + per-card score badges (color-coded by intensity) + score progress column in table view. Overview tab shows the market-opportunity panel under offensive lens. Lens scoring respects Google ratings when available, falls back to neutral 3.5 default. 11 dedicated lens tests verify scoring math and edge cases.
 
 ### ✅ Phase 8 — Multi-market comparison
-Sidebar "Save to comparison" + "Clear" buttons populate `st.session_state["saved_sheets"]`. New 5th tab "Compare (N)" renders side-by-side: KPI table with progress columns + opportunity score, grouped Plotly bar chart for normalized metric comparison, top-providers-per-market alignment, provider-overlap matrix sorted by ubiquity. Lens-aware: offensive lens ranks markets by entrant-opportunity score. Per-state caching means 2nd+ markets in the same state are near-instant.
+"Save current market" + "Clear" buttons in the v2 left rail populate `LookupState.saved_markets`. The Compare tab renders a Radix surface table with one row per saved market (population / MFI / MDU share / providers / fiber available / IAS take rate) plus a per-row `x` remove button. Lens-aware: offensive lens ranks saved markets by entrant-opportunity score. Per-state BDC caching means 2nd+ markets in the same state are near-instant.
 
 ### ✅ Pipeline parallelization (ACS + BDC + Ookla)
-`run_market` previously ran Census ACS, FCC BDC providers, and Ookla speeds strictly sequentially. After TIGER resolves the geoids those three blocks are independent — none depends on any other's result. Refactored to launch all three in a `ThreadPoolExecutor(max_workers=3)` and gather. Wall-time win on cold lookups is ~10-20s (BDC stays the long pole at ~30-90s; ACS ~5-15s and Ookla ~5-15s collapse into the BDC window). DuckDB / httpx / GeoPandas each create their own connections per call, so they're safe to run concurrently in threads. `_emit` (the Streamlit progress hook) is the only shared global; ordering is now interleaved but the Reflex UI doesn't use that callback. All 195 tests still green.
+`run_market` previously ran Census ACS, FCC BDC providers, and Ookla speeds strictly sequentially. After TIGER resolves the geoids those three blocks are independent — none depends on any other's result. Refactored to launch all three in a `ThreadPoolExecutor(max_workers=3)` and gather. Wall-time win on cold lookups is ~10-20s (BDC stays the long pole at ~30-90s; ACS ~5-15s and Ookla ~5-15s collapse into the BDC window). DuckDB / httpx / GeoPandas each create their own connections per call, so they're safe to run concurrently in threads.
+
+### ✅ Staged `/v2` paint (A1 / A2 / B1 / B2)
+`LookupState.run_lookup` paints in four phases so KPIs appear before the slow IAS / Ookla / momentum fetches finish. **A1** (fast base: TIGER + ACS + BDC + housing) paints KPIs + provider list in ~30-50s. **A2** (enrichment: IAS anchor + Ookla speeds + Google ratings) fills in another ~10-20s later. **B1** (subs history) paints the take-rate trajectory sparkline ~30s after A2. **B2** (velocity + trajectory) fills the 12-month delta panel and per-provider sparklines ~5 min after B1 on a cold state. Nav-bar spinner labels ("Loading map and data...", "Loading momentum data...") track the active phase.
+
+### ✅ IAS history seed at Docker build time
+HF Spaces free-tier disk is ephemeral and HF rejects every binary file on push without Xet/LFS, so the 14 historical IAS release zips (Dec 2015 → Jun 2022) can't ship in git. Dockerfile now `RUN curl`s them from `https://www.fcc.gov/sites/default/files/tract_map_*.zip` at image build time, baking them into the image. Cold containers start with `<FTTH_DATA_DIR>/raw/ias/` pre-populated and the take-rate sparkline paints in ~30s instead of 1-2 min per redeploy.
 
 ### ✅ Loading UX + error handling
-Pipeline emits 6 progress phases via `set_progress_callback`. Sidebar uses `st.status()` to show live phase updates during cold lookups (e.g. "Downloading BDC providers for CO (release 2025-06-30; ~90s on first state)..."). Bad-city `ValueError` is caught and rendered as a friendly error message naming the typed input + Quick-pick fallback, instead of a red Python traceback.
+Bad-city `ValueError` is caught in `run_lookup` and rendered as a friendly error message naming the typed input, with the Quick-pick presets as fallback, instead of a red Python traceback. Phase progress is surfaced via Reflex state fields (`is_loading`, `enrich_loading`, `momentum_loading`, `momentum_note`) rather than a free-text callback.
+
+### ✅ Shareable URL deployment
+Free-tier deploy at `https://dhruvkrishna49-ftth-compete.hf.space/` (Hugging Face Spaces, Docker SDK, Caddy fronting Reflex). Pushes to `main` trigger `.github/workflows/deploy.yml` which force-pushes to the HF git remote; HF rebuilds the image and restarts the container. Privacy posture: HF Space is public (private Spaces 404 anonymous visitors). Ookla non-commercial license still respected — the deployed link is the same personal-use tool, just network-reachable.
+
+### ✅ Private visitor sidecar
+`/admin?key=<ADMIN_KEY>` route gated by an env-secret; wrong / missing key returns 404 to be indistinguishable from "no such route". SQLite-backed event log (`market_lookup`, `tab`, `lens`, `incumbent`, `tract_click`, `provider_click`) at `<FTTH_DATA_DIR>/visitors.db`. IPs hashed (first 8 chars of SHA-256). User-agent truncated. Storage is ephemeral on the HF free tier — wipes on container restart, which is acceptable for casual visibility.
 
 ### 💭 Future (post-v1)
 - LLM-generated narrative summary (currently deterministic templating).
-- Time-series of BDC releases — provider footprint trajectory across last 4 quarters.
 - BDC fabric integration via CostQuest Tier 4 research license — gives address-level outputs.
 - Internal subscriber data integration (if available; Altice context).
 - Custom incumbent picker for defensive lens (any provider, not just hard-coded).
-- Streamlit Cloud deployment for shareable URLs (post-v1, requires keeping Ookla non-commercial).
 - Browser screenshot generation as alternative to PDF.
+- M-Lab BigQuery wire-up for advertised-vs-measured per provider (Phase 6d left a scaffold; needs `google-cloud-bigquery` install + a service account credential).
 
 ## Polish / quality backlog
 
@@ -157,36 +168,23 @@ These aren't phase-gated — pick them up opportunistically. Listed here so we d
 - **Multi-tech provider counts.** When Comcast files as `"40, 50"` it means it serves both Cable AND Fiber locations, but the same `location_id` may appear in both tech rows. Verify our `COUNT(DISTINCT location_id)` doesn't double-count.
 
 ### UX polish
-- **Number formatting helpers.** Consistent `22,324` not `22324`; `$74,411` not `74410.69754279`; `13.5%` not `0.13466164389778967`. Build `format.py` with `fmt_int`, `fmt_currency`, `fmt_pct`. Use everywhere.
-- **Generated narrative quality.** Current narrative is implicit (we don't even generate one yet). Build a deterministic templating system that handles missing data gracefully and reads natural.
-- **Help text / tooltips.** Each KPI card should have a `help=` tooltip explaining the methodology (e.g., "Pop-weighted mean of tract medians; not exact market median").
-- **Error states.** What does the dashboard show if Census API is down? If FCC creds are missing? If a market has zero tracts? Each needs a clear non-crash UI message.
-- **Loading states.** Cold market lookup is ~90s. Streamlit's default spinner is fine but progress phases ("Resolving tracts → fetching ACS → downloading BDC...") would be better.
-- **Boundary tract toggle in sidebar.** Include/exclude with count display.
-- **Provider drill-down.** Click a provider card → see per-tract presence, raw brand names, file IDs. For debugging and trust.
+- **Error states.** What does the dashboard show if Census API is down? If FCC creds are missing? If a market has zero tracts? Each path needs a clear non-crash UI message — today most surface as a generic `lookup_error` string.
+- **Boundary tract toggle in the v2 sidebar.** Include / exclude with count display. Today it's in the Advanced accordion; pulling it out as a top-level toggle would make the boundary tracts UX more discoverable.
 
 ### Performance
-- **Streamlit cache strategy.** `@st.cache_data` on `pipeline.run_market` keyed by (city, state, options). `@st.cache_resource` for DuckDB connections. Cache versioning on data version changes.
 - **HTTP caching headers.** TIGER files are large and don't change often within a year. Add `If-Modified-Since` checks before re-downloading.
 - **Per-state BDC pre-warm.** Optional `make refresh-state STATE=CO` to download a state ahead of first market lookup.
 - **Polars / DuckDB query review.** The `coverage_matrix` query loads the entire state parquet — fine for small states, may need pushdown for CA/TX.
+- **HF persistent storage ($5/mo).** Today every container restart wipes the BDC / IAS / ACS / screener disk caches. Persistent storage would make `/screener` re-runs and momentum lookups warm across deploys. The IAS history seed already runs at Docker-build time as a workaround; persistent storage would generalise the win to everything else.
 
 ### Hygiene
-- **Logging cleanup.** httpx logs the full URL including the Census API key as a query param. Filter or redact. Same for any FCC API params.
-- **Test coverage for network code.** `data/fcc_bdc.py`, `data/census_acs.py`, `data/tiger.py`, `data/google_places.py`, `data/ookla.py` all hit external APIs. Add `respx`-based mock tests for response parsing without actual network calls.
+- **Test coverage for network code.** `data/fcc_bdc.py`, `data/census_acs.py`, `data/tiger.py`, `data/google_places.py`, `data/ookla.py`, `data/fcc_ias.py` all hit external APIs. Add `respx`-based mock tests for response parsing without actual network calls.
 - **Pyproject `dependency-groups` vs `optional-dependencies`.** Currently both are defined; clean up to one.
 - **Mypy strict pass.** Currently configured but not enforced. Several modules have `Any` slipping through.
 - **Ruff format pass.** Ensure `uv run ruff format .` is clean.
-
-### Analysis depth
-- **Tract-level coverage stats.** Currently aggregated to "tracts_served" and "coverage_pct". Could surface per-tract coverage for the map's click popup.
-- **Provider expansion velocity.** Compare BDC release N to release N-2 (1yr ago) — show new locations a provider has added. Powers the "12-month delta" KPI in the plan.
-- **Speed tier breakdown.** Currently we report max advertised speeds. Could break down what % of locations get gigabit+ vs 100Mbps+ vs <100Mbps per provider.
-- **Competitive density metric.** Per-tract count of fiber providers — already feasible from the matrix; surface as a heatmap layer.
+- **Reflex `RouterData.page` deprecation.** `maybe_autorun` reads `self.router.page.params`; Reflex 0.8.1 deprecated this in favour of `self.router.url`. Migrate before Reflex 1.0 drops `RouterData.page` entirely.
 
 ### Documentation
-- **README usage section.** Currently sparse. Add a "what does this output look like" section with screenshots once dashboard exists.
-- **Methodology page in app.** A separate Streamlit page that explains every metric and its caveats. Linked from each KPI tooltip.
 - **`make refresh` user-facing CLI.** Currently `pipelines/refresh_*.py` are stubs. Wire them so `make refresh` actually re-pulls all sources.
 
 ## How to use this roadmap

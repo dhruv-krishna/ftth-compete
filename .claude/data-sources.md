@@ -73,7 +73,7 @@ Source: https://help.bdc.fcc.gov/hc/en-us/articles/5290793888795
 
 > Speed test data © Ookla, 2019–present, distributed under CC BY-NC-SA 4.0.
 
-Place this in the Streamlit footer and any exported PDF/CSV.
+Place this in the Reflex UI footer and any exported PDF/CSV.
 
 ## Google Places API (New)
 

@@ -4,7 +4,7 @@ This is the entry-point doc Claude Code auto-loads. **Keep it short.** Deeper co
 
 ## What this project is
 
-`ftth-compete` is a personal, non-commercial FTTH market competitive intelligence tool. Four cross-linked Reflex pages:
+`ftth-compete` is a personal, non-commercial FTTH market competitive intelligence tool. Four cross-linked Reflex pages + a private admin sidecar:
 
 | Route | Use |
 |------|-----|
@@ -12,9 +12,9 @@ This is the entry-point doc Claude Code auto-loads. **Keep it short.** Deeper co
 | `/screener` | **Batch screener.** Pick states + filter ranges → ranked table of candidate markets with opportunity score, CSV export, "Open in v2" deep-link per row |
 | `/providers` | **Provider directory.** Every canonical provider with a footprint in cached BDC data, sortable by states / tracts / fiber tracts / locations |
 | `/provider/<slug>` | **Provider detail.** National state-level footprint map, per-state breakdown, head-to-head competitor overlap, trajectory across cached BDC releases |
-| `/` (v1) | Legacy tabbed UI. Same data, less polished. Kept for backup but new development is on v2 |
+| `/admin?key=<ADMIN_KEY>` | **Private visitor log.** SQLite-backed event store (`market_lookup`, `tab`, `lens`, `tract_click`, `provider_click`). Wrong / missing key → 404. See [reference_admin_sidecar memory](../../../Users/dkrishn3/.claude/projects/.../memory/reference_admin_sidecar.md). |
 
-All four routes share data via cached BDC parquets + ACS + TIGER + IAS. The v2 page is the canonical entry point.
+All four user-facing routes share data via cached BDC parquets + ACS + TIGER + IAS. The v2 page is the canonical entry point.
 
 ## Use scope
 
@@ -22,27 +22,30 @@ All four routes share data via cached BDC parquets + ACS + TIGER + IAS. The v2 p
 
 ## Stack
 
-Python 3.12 · uv · **Reflex** (UI; compiles to Next.js/React) · Plotly 6 / MapLibre · DuckDB · Polars · GeoPandas · Folium (legacy v1) · httpx + tenacity · pydantic-settings · SQLite for API caching · Starlette endpoints (`/v2_map_html`, `/provider_map_html`) for iframe-served Plotly figures.
+Python 3.12 · uv · **Reflex** (UI; compiles to Next.js/React) · Plotly 6 / MapLibre · DuckDB · Polars · GeoPandas · Folium (for the `/v2` Map tab) · httpx + tenacity · pydantic-settings · SQLite for API caching · Starlette endpoints (`/v2_map_html`, `/provider_map_html`, `/admin`) hung off `app._api` for iframe-served Plotly figures + the admin sidecar.
 
 ## Run commands
 
 ```powershell
 uv sync                 # install deps
-uv run pytest           # tests (194 currently)
+uv run pytest           # tests (186 currently)
 uv run reflex run       # dashboard at localhost:3000 (backend :8000)
 make refresh            # download/refresh datasets (~30 min cold)
 make smoke              # E2E test against Evans CO, Plano TX, Brooklyn NY
 ```
 
+## Deployment
+
+Hosted free-tier on Hugging Face Spaces: <https://dhruvkrishna49-ftth-compete.hf.space/>. Visibility is **public** (private Spaces 404 anonymous visitors). Pushes to `main` on the GitHub repo trigger `.github/workflows/deploy.yml`, which force-pushes the branch to the HF git remote. HF then rebuilds the Docker image (Caddy fronting Reflex at :7860 → :3000 frontend + :8000 backend) and restarts the container. Rebuild + boot ≈ 5–10 min. See [reference_hf_space memory](../../../Users/dkrishn3/.claude/projects/.../memory/reference_hf_space.md) for the gotchas — most notably HF rejects every binary file on push without Xet/LFS, so binary assets (like the IAS history zips) are fetched at Docker build time via `RUN curl`.
+
 ## Repo location
 
-Lives at `C:\Users\dkrishn3\OneDrive - AlticeUSA\Personal\FTTH\` (under user-managed OneDrive). To avoid sync churn on the heavy stuff:
+**Dev work happens at `C:\dev\ftth-compete\`.** That's where the git remote is wired up and where Reflex hot-reload runs cleanly. The legacy OneDrive copy at `C:\Users\dkrishn3\OneDrive - AlticeUSA\Personal\FTTH\` is now read-only / archival only — file-watch sync conflicts with `.web/`, `.venv/`, and parquet caches made it untenable for live work.
 
-- `.venv/` is created OUTSIDE OneDrive via `UV_PROJECT_ENVIRONMENT=C:\Users\dkrishn3\.venvs\ftth-compete` (set in `.env`).
-- `data/raw/` and `data/processed/` go outside OneDrive via `FTTH_DATA_DIR=C:\Users\dkrishn3\ftth-compete-data` (set in `.env`).
-- Source, tests, and `.claude/` docs DO sync via OneDrive — that's fine and even useful as a backup.
+`.env` defaults still steer the heavy stuff outside any sync path:
 
-**Dev work happens at `C:\dev\ftth-compete\`** (clone outside OneDrive to avoid file-watch sync conflicts during Reflex hot-reload). The OneDrive copy is for backup / cross-machine sync only.
+- `.venv/` lives at `UV_PROJECT_ENVIRONMENT=C:\Users\dkrishn3\.venvs\ftth-compete`.
+- Data caches live at `FTTH_DATA_DIR=C:\Users\dkrishn3\ftth-compete-data`.
 
 ## Caches
 
@@ -63,6 +66,7 @@ Three tiers, all auto-invalidating:
 - **Lenses are thin re-weighting layers.** Underlying data isn't mutated. Defensive lens picks any incumbent, not just Optimum.
 - **No emojis in code or docs unless the user asks.** They asked to strip them from UI strings (Nov 2026); keep prose plain text.
 - **State isolation per route.** `LookupState` (market deep-dive) / `ScreenerState` (batch) / `ProviderViewState` (directory + detail) are separate so heavy state from one workflow doesn't bleed into another.
+- **Staged `/v2` paint via four phases.** `run_lookup` paints in stages so users see progress sooner: **A1** = fast base (TIGER + ACS + BDC + housing + heuristic penetration, no IAS/Ookla/Places), **A2** = enrichment (IAS anchor + Ookla speeds + Google ratings), **B1** = subs-history sparkline, **B2** = velocity + trajectory. Each phase ends with an `async with self:` block to publish state and either yields the next event handler or paints + waits. Nav-bar spinner labels (`Loading map and data...`, `Loading momentum data...`) track which phase is in flight.
 
 ## Sibling docs
 
