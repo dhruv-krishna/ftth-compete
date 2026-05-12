@@ -188,7 +188,10 @@ def load_zcta_tract_crosswalk(*, force_refresh: bool = False):
 def _download_zip(url: str, target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     log.info("Downloading %s", url)
-    with httpx.stream("GET", url, timeout=120.0, follow_redirects=True) as r:
+    # 240s read timeout — TIGER state geopackages are 30-100MB and a
+    # corporate / cellular network can stall mid-stream for tens of
+    # seconds at a time. 120s was occasionally clipping large states.
+    with httpx.stream("GET", url, timeout=240.0, follow_redirects=True) as r:
         r.raise_for_status()
         buf = io.BytesIO()
         for chunk in r.iter_bytes(chunk_size=1 << 20):

@@ -84,7 +84,7 @@ def _text_search(query: str) -> str | None:
     }
     body: dict[str, object] = {"textQuery": query, "pageSize": 1}
     log.info("Places searchText: %r", query)
-    r = httpx.post(url, headers=headers, json=body, timeout=15.0)
+    r = httpx.post(url, headers=headers, json=body, timeout=30.0)
     if r.status_code == 401:
         raise RuntimeError("Google Places returned 401 - check GOOGLE_PLACES_KEY")
     r.raise_for_status()
@@ -113,7 +113,7 @@ def _place_details(place_id: str) -> Rating | None:
         "X-Goog-FieldMask": "id,displayName,rating,userRatingCount,googleMapsUri",
     }
     log.info("Places details: %s", place_id)
-    r = httpx.get(url, headers=headers, timeout=15.0)
+    r = httpx.get(url, headers=headers, timeout=30.0)
     if r.status_code == 401:
         raise RuntimeError("Google Places returned 401 - check GOOGLE_PLACES_KEY")
     r.raise_for_status()

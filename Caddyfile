@@ -14,7 +14,11 @@
         level INFO
     }
 
-    # WebSocket — explicit upgrade headers.
+    # WebSocket — explicit upgrade headers. flush_interval -1 disables
+    # response buffering so server-pushed state mutations reach the
+    # browser immediately, and the transport read/write timeouts are
+    # raised well above the longest backfill (B2 momentum ~5 min) so
+    # the proxy never idle-kills a live event handler.
     @websocket {
         path /_event /_event/*
         header Connection *Upgrade*
@@ -22,18 +26,30 @@
     }
     handle @websocket {
         reverse_proxy 127.0.0.1:8000 {
+            flush_interval -1
             header_up Host {host}
             header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
+            transport http {
+                read_timeout 30m
+                write_timeout 30m
+                dial_timeout 10s
+            }
         }
     }
 
     # Non-WS backend endpoints (health checks + the Plotly HTML iframes
-    # + the private /admin sidecar).
+    # + the private /admin sidecar). Map renders can take 30-60s on a
+    # cold market — give granian generous read timeouts so Caddy
+    # doesn't return a 504 mid-render.
     @backend path /_event /_event/* /_health /ping /v2_map_html* /provider_map_html* /admin /admin*
     handle @backend {
-        reverse_proxy 127.0.0.1:8000
+        reverse_proxy 127.0.0.1:8000 {
+            transport http {
+                read_timeout 5m
+                write_timeout 5m
+                dial_timeout 10s
+            }
+        }
     }
 
     # Frontend (Next.js export served by Reflex prod-mode static server).

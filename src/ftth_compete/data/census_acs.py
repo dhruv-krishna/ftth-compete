@@ -17,9 +17,27 @@ from typing import Final
 
 import httpx
 import polars as pl
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from ..config import get_settings
 from . import cache
+
+# Retry-on-transient policy for external APIs. Census + FCC are
+# routinely flaky for ~seconds at a time during peak hours; one-shot
+# failures end up in the user's face as a "server is timing out"
+# message. 3 attempts with exponential backoff (1s → 2s → 4s) catches
+# the vast majority of transient blips without blowing the wall clock.
+_TRANSIENT_HTTPX: Final = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -96,11 +114,28 @@ def _fetch_county(state: str, county: str, api_key: str) -> list[list[str]]:
         "key": api_key,
     }
     log.info("ACS fetch state=%s county=%s", state, county)
-    r = httpx.get(BASE_URL, params=params, timeout=30.0)
-    r.raise_for_status()
-    data = r.json()
+    data = _acs_request(params)
     cache.put(CACHE_SOURCE, cache_key, json.dumps(data).encode("utf-8"))
     return data
+
+
+@retry(
+    retry=retry_if_exception_type(_TRANSIENT_HTTPX),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+def _acs_request(params: dict[str, str]) -> list[list[str]]:
+    """One ACS API call, wrapped in a 3-attempt exponential backoff.
+
+    Timeout bumped from 30s → 60s — the Census API has occasional
+    minute-long latency spikes during peak business hours, and 30s
+    was causing user-visible failures on otherwise-recoverable
+    requests.
+    """
+    r = httpx.get(BASE_URL, params=params, timeout=60.0)
+    r.raise_for_status()
+    return r.json()
 
 
 def fetch_market_metrics(geoids: list[str]) -> AcsResult:
