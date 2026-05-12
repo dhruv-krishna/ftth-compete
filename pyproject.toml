@@ -36,6 +36,11 @@ dev = [
     "ruff>=0.7",
     "mypy>=1.13",
     "types-requests",
+    # Used by scripts/refresh_bdc_states.py to push the pre-converted
+    # BDC parquets to the public HF Dataset that the Dockerfile curls
+    # at image build time. Dev-only — not needed in the deployed
+    # container.
+    "huggingface_hub>=0.27",
 ]
 
 [project.scripts]

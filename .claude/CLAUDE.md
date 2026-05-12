@@ -77,6 +77,7 @@ Three tiers, all auto-invalidating:
 - [methodology.md](methodology.md) — penetration estimation math, IAS lag handling, lens weighting, take-rate trajectory scope
 - [ux-spec.md](ux-spec.md) — Reflex page layout, lens semantics, copy guidelines
 - [dev-notes.md](dev-notes.md) — gotchas, debugging recipes, things that bit us
+- [refresh-bdc-workflow.md](refresh-bdc-workflow.md) — how to refresh the public HF Dataset of pre-converted BDC parquets after each biannual FCC release; the Dockerfile curls from there at build time so cold containers boot warm
 
 ## When updating these docs
 

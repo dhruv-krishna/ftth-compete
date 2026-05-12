@@ -110,6 +110,45 @@ RUN mkdir -p /home/user/app/data/raw/tiger/2024/ZCTA_TRACT_REL && \
         || echo "WARN: failed to fetch ZCTA->tract crosswalk" \
     ; chown -R user:user /home/user/app/data/raw/tiger
 
+# Pre-seed FCC BDC state parquets for the latest release from a public
+# HF Dataset (filled by `scripts/refresh_bdc_states.py`). The FCC BDC
+# API requires authenticated requests with rate limits, so we can't
+# fetch directly from FCC at Docker build time on HF Spaces (no
+# build-time secrets). Instead we publish the pre-converted parquets
+# to a public HF Dataset and curl from there — same auth-free fetch as
+# the IAS + TIGER seeds.
+#
+# Without these the first lookup in any state takes 30-90s while
+# `fcc_bdc.ingest_state` downloads + converts the BDC zip. With them
+# every state's first lookup is warm-disk fast (~5s).
+#
+# Refresh workflow: see `.claude/refresh-bdc-workflow.md` — re-run the
+# local refresh script after each new BDC release (biannual).
+#
+# `latest.txt` at the dataset root holds the current release as-of
+# date (YYYY-MM-DD). If the dataset is empty / unreachable / not yet
+# populated, every state download warns and falls back to the
+# runtime ingest path. Build never fails on a missing seed.
+ARG HF_BDC_DATASET=dhruvkrishna49/ftth-bdc-cache
+RUN HF_BASE="https://huggingface.co/datasets/${HF_BDC_DATASET}/resolve/main" && \
+    release=$(curl -fsSL "${HF_BASE}/latest.txt" 2>/dev/null | tr -d '[:space:]') && \
+    if [ -n "$release" ]; then \
+        echo "BDC seed: fetching release ${release} from ${HF_BDC_DATASET}"; \
+        mkdir -p "/home/user/app/data/processed/bdc/${release}"; \
+        cd "/home/user/app/data/processed/bdc/${release}"; \
+        for fips in 01 02 04 05 06 08 09 10 11 12 13 15 16 17 18 19 \
+                    20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 \
+                    36 37 38 39 40 41 42 44 45 46 47 48 49 50 51 53 \
+                    54 55 56 72; do \
+            curl -fsSL -o "state=${fips}.parquet" \
+                "${HF_BASE}/${release}/state=${fips}.parquet" \
+                || echo "  WARN: state=${fips} not available in seed (will fetch from FCC at runtime)"; \
+        done; \
+    else \
+        echo "BDC seed: latest.txt missing or dataset unreachable — skipping (states will ingest from FCC at runtime)."; \
+    fi && \
+    chown -R user:user /home/user/app/data/processed
+
 # Pre-build the frontend at image build time.
 #
 # Without this, the first invocation of `reflex run --env prod
