@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -186,42 +187,78 @@ def run_market(
     if include_boundary:
         geoids.extend(res.boundary_tract_geoids)
 
-    # 2) Demographics via Census ACS
-    _emit(f"Fetching Census ACS demographics for {len(geoids)} tracts...")
-    acs = census_acs.fetch_market_metrics(geoids)
-    metrics = market_mod.aggregate(acs.frame)
-    housing = housing_mod.split(acs.frame)
+    # 2) Independent fetches: ACS demographics, FCC BDC providers, Ookla
+    # measured speeds. None depends on the others' results, so run them
+    # concurrently in a small ThreadPool. On cold lookups this cuts wall
+    # time by 10-20s (BDC is the long pole at ~30-90s, ACS ~5-15s, Ookla
+    # ~5-15s — running them in parallel collapses to roughly max(...)).
+    # The DuckDB / httpx / GeoPandas calls each create their own
+    # connection/session, so they're thread-safe in concurrent threads.
+    # `_emit` is the only shared global; its callback runs are best-
+    # effort (Streamlit-only) and the Reflex UI doesn't use it.
+    def _phase_acs():
+        _emit(f"Fetching Census ACS demographics for {len(geoids)} tracts...")
+        return census_acs.fetch_market_metrics(geoids)
 
-    # 3) Providers via FCC BDC (optional; needs credentials)
-    providers_block: list[ProviderSummary] | None = None
-    providers_note: str | None = None
-    bdc_release: str | None = None
-    coverage_rows: list[dict[str, Any]] = []
-    location_avail_rows: list[dict[str, Any]] = []
-
-    if not no_providers:
-        if settings.fcc_username and settings.fcc_api_token:
-            try:
-                _emit("Querying FCC BDC for latest release...")
-                bdc_release = fcc_bdc.latest_release()
-                _emit(
-                    f"Downloading / loading BDC providers for {state} "
-                    f"(release {bdc_release}; ~90s on first state)..."
-                )
-                coverage = fcc_bdc.coverage_matrix(geoids, as_of=bdc_release)
-                providers_block = competitors_mod.score(coverage, n_tracts=len(geoids))
-                coverage_rows = coverage.to_dicts() if not coverage.is_empty() else []
-                _emit("Computing location-level availability per tract...")
-                avail = fcc_bdc.location_availability(geoids, as_of=bdc_release)
-                location_avail_rows = avail.to_dicts() if not avail.is_empty() else []
-            except Exception as exc:  # noqa: BLE001
-                log.exception("FCC BDC ingest failed")
-                providers_note = f"FCC BDC ingest failed: {exc}"
-        else:
-            providers_note = (
+    def _phase_bdc():
+        if no_providers:
+            return None, None, [], [], None
+        if not (settings.fcc_username and settings.fcc_api_token):
+            return None, None, [], [], (
                 "FCC_USERNAME / FCC_API_TOKEN not set in .env; provider data skipped. "
                 "Register at https://apps.fcc.gov/cores/userLogin.do."
             )
+        try:
+            _emit("Querying FCC BDC for latest release...")
+            release = fcc_bdc.latest_release()
+            _emit(
+                f"Downloading / loading BDC providers for {state} "
+                f"(release {release}; ~90s on first state)..."
+            )
+            coverage = fcc_bdc.coverage_matrix(geoids, as_of=release)
+            providers_local = competitors_mod.score(coverage, n_tracts=len(geoids))
+            cov_rows = coverage.to_dicts() if not coverage.is_empty() else []
+            _emit("Computing location-level availability per tract...")
+            avail = fcc_bdc.location_availability(geoids, as_of=release)
+            avail_rows = avail.to_dicts() if not avail.is_empty() else []
+            return release, providers_local, cov_rows, avail_rows, None
+        except Exception as exc:  # noqa: BLE001
+            log.exception("FCC BDC ingest failed")
+            return None, None, [], [], f"FCC BDC ingest failed: {exc}"
+
+    def _phase_ookla():
+        if no_speeds:
+            return [], "Ookla speed query skipped (no_speeds=True)."
+        try:
+            _emit("Aggregating Ookla measured speeds for market tracts...")
+            polys = tiger.tract_polygons(geoids, state)
+            speed_frame = ookla.fetch_tract_speeds(polys)
+            speeds_local = (
+                speed_frame.to_dicts() if not speed_frame.is_empty() else []
+            )
+            if not speeds_local:
+                return [], "No Ookla tiles in market bbox; low-sample area."
+            return speeds_local, None
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ookla fetch failed")
+            return [], f"Ookla fetch failed: {exc}"
+
+    with ThreadPoolExecutor(max_workers=3) as _pool:
+        f_acs = _pool.submit(_phase_acs)
+        f_bdc = _pool.submit(_phase_bdc)
+        f_ookla = _pool.submit(_phase_ookla)
+        acs = f_acs.result()
+        (
+            bdc_release,
+            providers_block,
+            coverage_rows,
+            location_avail_rows,
+            providers_note,
+        ) = f_bdc.result()
+        tract_speeds, speeds_note = f_ookla.result()
+
+    metrics = market_mod.aggregate(acs.frame)
+    housing = housing_mod.split(acs.frame)
 
     # Penetration estimates (heuristic from national take rates). Runs after
     # the BDC block so we have providers_block populated.
@@ -403,22 +440,9 @@ def run_market(
 
     tract_acs = acs.frame.to_dicts() if not acs.frame.is_empty() else []
 
-    # Ookla measured speeds (optional; queries S3 anonymously, ~5-15s)
-    tract_speeds: list[dict[str, Any]] = []
-    speeds_note: str | None = None
-    if not no_speeds:
-        try:
-            _emit("Aggregating Ookla measured speeds for market tracts...")
-            polys = tiger.tract_polygons(geoids, state)
-            speed_frame = ookla.fetch_tract_speeds(polys)
-            tract_speeds = speed_frame.to_dicts() if not speed_frame.is_empty() else []
-            if not tract_speeds:
-                speeds_note = "No Ookla tiles in market bbox; low-sample area."
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Ookla fetch failed")
-            speeds_note = f"Ookla fetch failed: {exc}"
-    else:
-        speeds_note = "Ookla speed query skipped (no_speeds=True)."
+    # (Ookla measured speeds are fetched concurrently with ACS + BDC at
+    # the top of the function — see `_phase_ookla`. `tract_speeds` and
+    # `speeds_note` are set there.)
 
     # Google Places ratings (optional; needs GOOGLE_PLACES_KEY)
     provider_ratings: dict[str, dict[str, Any] | None] = {}
