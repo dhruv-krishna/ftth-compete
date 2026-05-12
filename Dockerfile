@@ -53,10 +53,25 @@ COPY --chown=user:user src/ ./src/
 COPY --chown=user:user ftth_compete_web/ ./ftth_compete_web/
 COPY --chown=user:user rxconfig.py ./
 COPY --chown=user:user Caddyfile ./
-# data/seed/ would be copied here if it existed, but the seed parquet
-# is currently held out of git (HF Spaces blocks binary files without
-# LFS). cloud_seed.py no-ops when data/seed/ is missing, so removing
-# the COPY is safe.
+
+# Pre-download the FCC IAS historical subscription archive (14 zips,
+# ~4 MB total) at image build time. Bakes them into the image so the
+# trendline sparkline paints in ~30s on every cold container start
+# instead of redownloading from fcc.gov on every redeploy.
+#
+# Done at build time (not shipped in git) because HF Spaces rejects
+# every binary file without Xet/LFS, regardless of size. Build-time
+# curl avoids the git-side restriction entirely.
+RUN mkdir -p /home/user/app/data/raw/ias && \
+    cd /home/user/app/data/raw/ias && \
+    for f in dec_2015 jun_2016 dec_2016 jun_2017 dec_2017 jun_2018 \
+             dec_2018 jun_2019 dec_2019 jun_2020 dec_2020 jun_2021 \
+             dec_2021 jun_2022; do \
+        curl -fsSL -o "tract_map_${f}.zip" \
+            "https://www.fcc.gov/sites/default/files/tract_map_${f}.zip" \
+            || echo "WARN: failed to fetch tract_map_${f}.zip"; \
+    done && \
+    chown -R user:user /home/user/app/data
 
 # NOTE: we don't run `reflex export` at build time. The first invocation
 # of `reflex run` at container startup does the .web/ scaffold + frontend

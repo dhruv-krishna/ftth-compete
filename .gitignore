@@ -22,14 +22,12 @@ data/processed/
 data/cache.db
 data/cache.db-*
 *.parquet
-# Exception: slim seed parquets for the cloud demo's cold start. NOT
-# currently in use — Hugging Face Spaces rejects binary files without
-# Git LFS setup. Re-enable + add `.gitattributes` LFS tracking if you
-# want pre-warmed /providers + /screener on cloud cold start. The
-# cloud_seed module is harmless to keep around either way.
-# !data/seed/
-# !data/seed/**/*.parquet
-# !data/seed/**/*.meta
+# Cloud cold-start seeds used to live under `data/seed/` and ship in
+# git, but HF Spaces rejects every binary file (any size, not just
+# >10MB) without Xet/LFS — so the IAS history bundle is downloaded at
+# Docker build time instead (see Dockerfile). Keep this directory
+# gitignored so a local dev cache can land here without being staged.
+data/seed/
 
 # Editor / OS
 .vscode/

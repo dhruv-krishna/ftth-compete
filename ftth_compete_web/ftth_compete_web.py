@@ -1018,16 +1018,63 @@ class LookupState(rx.State):
         async with self:
             self.momentum_loading = wants_momentum
             self.momentum_note = (
-                "Fetching prior BDC releases..."
+                "Fetching take-rate trajectory..."
                 if wants_momentum
                 else ""
             )
 
-        # Phase B: kick off the momentum backfill as a follow-up event.
+        # Phase B1: subs-history (take-rate trajectory) is fast (~30s
+        # warm, ~2min cold over 17 IAS releases). Running it before the
+        # ~5min velocity + trajectory fetch in B2 means the Overview
+        # sparkline paints minutes sooner.
         if wants_momentum:
-            yield LookupState.backfill_momentum
+            yield LookupState.backfill_subs_history
 
-    # --- Follow-up: backfill velocity + trajectory ---------------------
+    # --- Follow-up: backfill historical IAS take-rate trajectory (B1) -
+    @rx.event(background=True)
+    async def backfill_subs_history(self):
+        """Fetch the multi-release IAS subscription history and paint
+        the trendline sparkline on the Overview tab.
+
+        Light vs B2: needs ~17 small IAS release parquets (~200-450KB
+        each). On a warm cache: sub-second. Cold: ~1-2min total.
+        The 14-release seed bundle keeps cold containers near-warm.
+        """
+        async with self:
+            if not self.has_result:
+                return
+            city = self.city.strip()
+            state = self.state.strip().upper()
+            include_boundary = self.include_boundary
+            no_speeds = self.no_speeds
+            no_ratings = self.no_ratings
+
+        try:
+            sheet = await asyncio.to_thread(
+                run_market,
+                city,
+                state,
+                include_boundary=include_boundary,
+                no_speeds=no_speeds,
+                no_ratings=no_ratings,
+                include_velocity=False,
+                include_trajectory=False,
+                include_subs_history=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Subs-history backfill failed")
+            async with self:
+                self.momentum_note = f"Trajectory unavailable: {exc}"
+            # Non-fatal: continue to B2 anyway so velocity still loads.
+        else:
+            async with self:
+                _populate_subs_history(self, sheet)
+                self.momentum_note = "Fetching prior BDC releases..."
+
+        # Phase B2: velocity + trajectory.
+        yield LookupState.backfill_momentum
+
+    # --- Follow-up: backfill velocity + trajectory (B2) ----------------
     @rx.event(background=True)
     async def backfill_momentum(self):
         """Re-run `run_market` with velocity + trajectory enabled and

@@ -29,36 +29,58 @@ def _seed_root() -> Path:
     return _repo_root() / "data" / "seed"
 
 
+def _data_root() -> Path:
+    import os
+    base = os.environ.get("FTTH_DATA_DIR") or str(_repo_root() / "data")
+    return Path(base)
+
+
 def _processed_root() -> Path:
     """Mirror of `ftth_compete.config.get_settings().processed_dir`.
 
     We re-derive it here (instead of importing config) so the seed step
     runs even if config has issues at import time on the cloud.
     """
-    import os
-    base = os.environ.get("FTTH_DATA_DIR") or str(_repo_root() / "data")
-    return Path(base) / "processed"
+    return _data_root() / "processed"
+
+
+def _raw_root() -> Path:
+    """Mirror of `ftth_compete.config.get_settings().raw_dir`."""
+    return _data_root() / "raw"
+
+
+# Bucket names under `data/seed/` whose destination is `raw/` (not
+# `processed/`). IAS history zips need to land in raw/ias/ where
+# `fcc_ias._list_local_zips` discovers them.
+_RAW_BUCKETS = {"ias"}
 
 
 def bootstrap_cloud_seed() -> None:
-    """Copy `data/seed/<bucket>/*` → `<processed_dir>/<bucket>/*` for any
+    """Copy `data/seed/<bucket>/*` → `<dest_root>/<bucket>/*` for any
     bucket where the destination is empty or missing.
 
-    Walks the seed tree by bucket (e.g. `provider_view`, `screener`) and
-    copies file-by-file so partial pre-existing buckets aren't clobbered.
+    Bucket-name → destination routing:
+      - `ias` → `<data_dir>/raw/ias/` (so `fcc_ias` finds the ZIPs)
+      - everything else → `<data_dir>/processed/<bucket>/`
+
+    Walks file-by-file and skips files that already exist (non-empty) so
+    pre-warmed caches from a previous container start aren't clobbered.
     """
     seed = _seed_root()
     if not seed.exists():
         return
-    dest_root = _processed_root()
-    dest_root.mkdir(parents=True, exist_ok=True)
+    _processed_root().mkdir(parents=True, exist_ok=True)
+    _raw_root().mkdir(parents=True, exist_ok=True)
 
     copied = 0
     skipped = 0
     for bucket in seed.iterdir():
         if not bucket.is_dir():
             continue
-        dest_bucket = dest_root / bucket.name
+        if bucket.name in _RAW_BUCKETS:
+            dest_bucket = _raw_root() / bucket.name
+        else:
+            dest_bucket = _processed_root() / bucket.name
         dest_bucket.mkdir(parents=True, exist_ok=True)
         for src_file in bucket.rglob("*"):
             if not src_file.is_file():
@@ -76,8 +98,8 @@ def bootstrap_cloud_seed() -> None:
                 log.warning("Failed to copy seed %s → %s: %s", src_file, dest_file, exc)
     if copied:
         log.info(
-            "[cloud_seed] Copied %d seed file(s) to %s (skipped %d already-present).",
-            copied, dest_root, skipped,
+            "[cloud_seed] Copied %d seed file(s) (skipped %d already-present).",
+            copied, skipped,
         )
 
 
