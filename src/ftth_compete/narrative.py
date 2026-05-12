@@ -7,9 +7,9 @@ sentences gracefully when their underlying data is missing.
 
 from __future__ import annotations
 
-from ..analysis.competitors import ProviderSummary
-from ..format import fmt_currency, fmt_int, fmt_pct, fmt_speed
-from ..pipeline import TearSheet
+from .analysis.competitors import ProviderSummary
+from .format import fmt_currency, fmt_int, fmt_pct, fmt_speed
+from .pipeline import TearSheet
 
 
 def market_narrative(sheet: TearSheet) -> str:

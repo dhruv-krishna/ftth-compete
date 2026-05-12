@@ -24,10 +24,11 @@
             - lenses.py (re-weighting)
                     │
                     ▼
-            [ Streamlit UI ]               src/ftth_compete/ui/
-            - Overview / Competitors / Map / Housing tabs
-            - Lens selector in sidebar
-            - Export: PDF / CSV / PNG
+            [ Reflex UI ]                  ftth_compete_web/
+            - /v2: single-market deep-dive (Overview/Competitors/...)
+            - /screener: batch state rank
+            - /providers + /provider/<slug>: provider-centric view
+            - /admin: private visitor log
 ```
 
 ## Why these choices
@@ -35,7 +36,7 @@
 - **DuckDB over pandas for FCC BDC.** Bulk files are ~100M rows nationally. DuckDB queries Parquet directly without a load step and is dramatically faster at this scale than a pandas read.
 - **Polars over pandas for in-memory transforms.** Lazy execution + faster joins on the data sizes we hit (per-market subsets are still hundreds of thousands of rows).
 - **uv over pip/poetry.** Faster installs, deterministic lockfile, modern standard.
-- **Streamlit over Dash/Flask.** 10× less boilerplate for a data-driven dashboard. Reactive model fits the workflow.
+- **Reflex over Streamlit/Dash/Flask.** Started in Streamlit for speed; migrated to Reflex to escape Streamlit's notebook-y ceiling and compile to a real Next.js/React app that survives polish. Pure-Python state model with explicit `@rx.event` handlers, no Streamlit-style top-to-bottom re-runs.
 - **Folium over Plotly maps.** Better choropleth UX with leaflet under the hood; tract polygons render well.
 - **SQLite over Redis for API caching.** Single file, no service to run, easy to inspect, fine for our throughput.
 

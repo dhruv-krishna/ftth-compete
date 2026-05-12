@@ -10,7 +10,7 @@ help:
 	@echo "  lint     - ruff check"
 	@echo "  type     - mypy strict"
 	@echo "  fmt      - ruff format"
-	@echo "  run      - launch streamlit dashboard"
+	@echo "  run      - launch the Reflex dashboard on localhost:3000"
 	@echo "  refresh  - download/refresh BDC + IAS + ACS + TIGER datasets"
 	@echo "  smoke    - end-to-end smoke test against Evans CO + Plano TX + Brooklyn NY"
 	@echo "  clean    - remove caches (keeps raw downloads)"
@@ -31,7 +31,7 @@ fmt:
 	uv run ruff format .
 
 run:
-	uv run streamlit run src/ftth_compete/ui/app.py
+	uv run reflex run
 
 refresh:
 	uv run python -m ftth_compete.pipelines.refresh_all

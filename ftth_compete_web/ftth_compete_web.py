@@ -23,7 +23,7 @@ from ftth_compete.analysis.lenses import apply as apply_lens
 from ftth_compete.data.tiger import STATE_FIPS
 from ftth_compete.format import fmt_currency, fmt_int, fmt_pct, fmt_speed
 from ftth_compete.pipeline import run_market
-from ftth_compete.ui.narrative import (
+from ftth_compete.narrative import (
     availability_share,
     fiber_availability_share,
     fiber_share,

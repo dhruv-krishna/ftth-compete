@@ -8,14 +8,12 @@ license = { text = "Personal / non-commercial" }
 authors = [{ name = "Dhruv Krishna" }]
 
 dependencies = [
-    "streamlit>=1.39",
     "duckdb>=1.1",
     "polars>=1.12",
     "geopandas>=1.0",
     "shapely>=2.0",
     "pyarrow>=18.0",
     "folium>=0.18",
-    "streamlit-folium>=0.23",
     "httpx>=0.28",
     "tenacity>=9.0",
     "pydantic>=2.9",

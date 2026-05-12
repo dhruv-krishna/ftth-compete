@@ -1,23 +1,14 @@
 """End-to-end market pipeline: city + state -> tear-sheet.
 
 Single source of truth for both the CLI (`ftth-compete market ...`) and the
-Streamlit dashboard. Keep this thin: orchestration only, no rendering or
-formatting. Any UI-specific transforms live in `ui/`; any domain-level math
-lives in `analysis/`.
-
-Progress-callback hook
-======================
-Long cold lookups (~90s for first state) benefit from per-phase progress.
-Callers that want per-phase messages can register a callback via
-`set_progress_callback(cb)`; `run_market` emits short status strings as it
-moves between phases. The callback is module-level (not threaded through
-arguments) so `@st.cache_data` hashing isn't affected.
+Reflex dashboard. Keep this thin: orchestration only, no rendering or
+formatting. UI-specific transforms live next to the Reflex app in
+`ftth_compete_web/`; domain-level math lives in `analysis/`.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -36,30 +27,15 @@ from .data import census_acs, fcc_bdc, fcc_ias, google_places, ookla, tiger
 
 log = logging.getLogger(__name__)
 
-# Module-level progress callback. Single slot — last writer wins. None by
-# default. Set/unset from the caller (typically the Streamlit app).
-_progress_cb: Callable[[str], None] | None = None
-
-
-def set_progress_callback(cb: Callable[[str], None] | None) -> None:
-    """Register (or clear) a per-phase progress callback for run_market.
-
-    Pass a function `(label: str) -> None` to receive phase messages.
-    Pass `None` to clear. Safe to call from non-Streamlit contexts.
-    """
-    global _progress_cb
-    _progress_cb = cb
-
 
 def _emit(label: str) -> None:
-    """Emit a progress message if a callback is set; always log INFO."""
+    """Log a phase message at INFO. Used to be a callback hook for
+    Streamlit's `st.status` progress UI; now it's just a logger since
+    the Reflex UI consumes structured state, not free-text phase
+    messages. Kept as a function so all the `_emit("...")` call sites
+    stay readable as "this is a pipeline phase boundary."
+    """
     log.info("phase: %s", label)
-    if _progress_cb is not None:
-        try:
-            _progress_cb(label)
-        except Exception:  # noqa: BLE001
-            log.exception("progress callback raised; clearing")
-            set_progress_callback(None)
 
 
 @dataclass(frozen=True)

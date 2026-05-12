@@ -1,12 +1,12 @@
-"""Tests for ftth_compete.ui.narrative."""
+"""Tests for ftth_compete.narrative."""
 
 from __future__ import annotations
 
 from ftth_compete.analysis.competitors import ProviderSummary
 from ftth_compete.analysis.housing import HousingSplit
 from ftth_compete.analysis.market import MarketMetrics
+from ftth_compete.narrative import fiber_share, market_narrative
 from ftth_compete.pipeline import TearSheet
-from ftth_compete.ui.narrative import fiber_share, market_narrative
 
 
 def _sheet(
