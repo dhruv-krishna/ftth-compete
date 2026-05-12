@@ -8,6 +8,7 @@ formatting. UI-specific transforms live next to the Reflex app in
 
 from __future__ import annotations
 
+import functools
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -125,7 +126,52 @@ def run_market(
     trajectory_points: int = 4,
     include_subs_history: bool = False,
 ) -> TearSheet:
-    """Resolve a market end-to-end and return a TearSheet.
+    """Public entry: normalize the city/state casing then delegate to
+    the LRU-cached implementation. Normalization here means repeat
+    lookups like `Evans, CO` / `evans, co` / `EVANS, CO` share a cache
+    entry — they all resolve to the same tracts anyway."""
+    return _run_market_cached(
+        city.strip(),
+        state.strip().upper(),
+        include_boundary=bool(include_boundary),
+        no_providers=bool(no_providers),
+        no_speeds=bool(no_speeds),
+        no_ratings=bool(no_ratings),
+        no_ias=bool(no_ias),
+        include_velocity=bool(include_velocity),
+        include_trajectory=bool(include_trajectory),
+        trajectory_points=int(trajectory_points),
+        include_subs_history=bool(include_subs_history),
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _run_market_cached(
+    city: str,
+    state: str,
+    *,
+    include_boundary: bool = False,
+    no_providers: bool = False,
+    no_speeds: bool = False,
+    no_ratings: bool = False,
+    no_ias: bool = False,
+    include_velocity: bool = False,
+    include_trajectory: bool = False,
+    trajectory_points: int = 4,
+    include_subs_history: bool = False,
+) -> TearSheet:
+    """LRU-cached implementation. `TearSheet` is a frozen dataclass and
+    every field is either a frozen dataclass, a primitive, or a
+    `list[dict]` that callers treat as read-only — sharing instances
+    across callers is safe.
+
+    `maxsize=32` is sized for a single-process Reflex backend: enough
+    to hold every market a user clicks through in a session without
+    blowing memory (each TearSheet is ~50-200 KB depending on tract
+    count). Container restart wipes the cache; that's fine since the
+    on-disk Parquet caches still warm it up cheaply.
+
+    Resolve a market end-to-end and return a TearSheet.
 
     Args:
         city: City name (e.g., "Evans").
@@ -345,54 +391,116 @@ def run_market(
     else:
         subs_history_note = "Subscription history skipped (include_subs_history=False)."
 
-    # Provider expansion velocity (12-month coverage delta) — opt-in.
+    # B2 (velocity + trajectory): figure out every BDC release we need,
+    # fetch them all concurrently, then compute the two analyses from
+    # the shared snapshot dict. Previously these were two sequential
+    # blocks each doing its own fetches; on a 4-point trajectory with
+    # velocity opt-in that meant 5 serial coverage_matrix calls
+    # (~20 min cold worst case). Concurrent gather over up to 4 workers
+    # collapses to roughly the slowest single fetch.
     provider_velocity_rows: list[dict[str, Any]] = []
     velocity_note: str | None = None
+    provider_trajectory_rows: list[dict[str, Any]] = []
+    trajectory_note: str | None = None
+
+    # Compute the set of needed releases up front so we can de-dup
+    # (velocity's prev_release often overlaps trajectory's series).
+    needed_releases: set[str] = set()
+    prev_release: str | None = None
+    trajectory_releases: list[str] = []
+
     if include_velocity:
-        if providers_block and bdc_release:
-            try:
-                _emit("Resolving previous BDC release (~12mo prior)...")
-                prev_release = fcc_bdc.previous_release(bdc_release, months_back=12)
-                _emit(
-                    f"Downloading / loading prior BDC release {prev_release} "
-                    f"for {state} (~5 min on first cold lookup)..."
-                )
-                prev_coverage = fcc_bdc.coverage_matrix(geoids, as_of=prev_release)
-                prev_providers = competitors_mod.score(prev_coverage, n_tracts=len(geoids))
-                velocity = velocity_mod.compute(
-                    providers_block, prev_providers,
-                    current_release=bdc_release, prev_release=prev_release,
-                )
-                provider_velocity_rows = [asdict(v) for v in velocity]
-            except Exception as exc:  # noqa: BLE001
-                log.exception("BDC velocity computation failed")
-                velocity_note = f"Velocity computation failed: {exc}"
-        else:
+        if not (providers_block and bdc_release):
             velocity_note = "include_velocity requested but no BDC providers loaded."
+        else:
+            try:
+                prev_release = fcc_bdc.previous_release(bdc_release, months_back=12)
+                needed_releases.add(prev_release)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("BDC previous_release lookup failed")
+                velocity_note = f"Velocity skipped: {exc}"
     else:
         velocity_note = "Velocity skipped (include_velocity=False)."
 
-    # Multi-release trajectory (4 BDC releases stepping ~6mo apart) — opt-in.
-    provider_trajectory_rows: list[dict[str, Any]] = []
-    trajectory_note: str | None = None
     if include_trajectory:
-        if providers_block and bdc_release:
+        if not (providers_block and bdc_release):
+            trajectory_note = "include_trajectory requested but no BDC providers loaded."
+        else:
             try:
-                _emit(
-                    f"Resolving {trajectory_points} BDC releases for trajectory..."
+                trajectory_releases = list(
+                    fcc_bdc.trajectory_releases(
+                        bdc_release, n_points=trajectory_points, months_step=6,
+                    )
                 )
-                releases = fcc_bdc.trajectory_releases(
-                    bdc_release, n_points=trajectory_points, months_step=6
+                needed_releases.update(
+                    r for r in trajectory_releases if r != bdc_release
                 )
-                snapshots: list[tuple[str, list[ProviderSummary]]] = []
-                for rel in releases:
-                    if rel == bdc_release:
-                        snapshots.append((rel, providers_block))
-                        continue
-                    _emit(f"Loading BDC release {rel} for trajectory...")
-                    snap_cov = fcc_bdc.coverage_matrix(geoids, as_of=rel)
-                    snap_providers = competitors_mod.score(snap_cov, n_tracts=len(geoids))
-                    snapshots.append((rel, snap_providers))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("BDC trajectory_releases lookup failed")
+                trajectory_note = f"Trajectory skipped: {exc}"
+    else:
+        trajectory_note = "Trajectory skipped (include_trajectory=False)."
+
+    # Snapshot dict keyed by release. Current release is already loaded
+    # (providers_block from Phase A1), no need to refetch.
+    release_snapshots: dict[str, list[ProviderSummary]] = {}
+    if providers_block and bdc_release:
+        release_snapshots[bdc_release] = providers_block
+
+    if needed_releases:
+        _emit(
+            f"Fetching {len(needed_releases)} BDC release(s) concurrently "
+            f"for momentum ({state}, ~5 min each cold)..."
+        )
+
+        def _fetch_release(rel: str):
+            cov = fcc_bdc.coverage_matrix(geoids, as_of=rel)
+            return rel, competitors_mod.score(cov, n_tracts=len(geoids))
+
+        with ThreadPoolExecutor(max_workers=min(len(needed_releases), 4)) as pool:
+            futures = {pool.submit(_fetch_release, r): r for r in needed_releases}
+            for fut in futures:
+                rel = futures[fut]
+                try:
+                    rel_out, snap = fut.result()
+                    release_snapshots[rel_out] = snap
+                except Exception as exc:  # noqa: BLE001
+                    # Per-release failure stays granular — velocity /
+                    # trajectory will skip whichever is short of data
+                    # and surface a note, but the rest still computes.
+                    log.exception("BDC release %s fetch failed: %s", rel, exc)
+
+    # Compute velocity from the gathered snapshots.
+    if include_velocity and prev_release and providers_block and bdc_release:
+        if prev_release in release_snapshots:
+            try:
+                velocity = velocity_mod.compute(
+                    providers_block, release_snapshots[prev_release],
+                    current_release=bdc_release, prev_release=prev_release,
+                )
+                provider_velocity_rows = [asdict(v) for v in velocity]
+                velocity_note = None
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Velocity computation failed")
+                velocity_note = f"Velocity computation failed: {exc}"
+        else:
+            velocity_note = (
+                f"Velocity skipped: prior BDC release {prev_release} "
+                "could not be loaded."
+            )
+
+    # Compute trajectory from the gathered snapshots.
+    if (
+        include_trajectory and trajectory_releases
+        and providers_block and bdc_release
+    ):
+        try:
+            snapshots: list[tuple[str, list[ProviderSummary]]] = [
+                (rel, release_snapshots[rel])
+                for rel in trajectory_releases
+                if rel in release_snapshots
+            ]
+            if snapshots:
                 trajectory = trajectory_mod.compute(snapshots)
                 provider_trajectory_rows = [
                     {
@@ -406,13 +514,14 @@ def run_market(
                     }
                     for t in trajectory
                 ]
-            except Exception as exc:  # noqa: BLE001
-                log.exception("BDC trajectory computation failed")
-                trajectory_note = f"Trajectory computation failed: {exc}"
-        else:
-            trajectory_note = "include_trajectory requested but no BDC providers loaded."
-    else:
-        trajectory_note = "Trajectory skipped (include_trajectory=False)."
+                trajectory_note = None
+            else:
+                trajectory_note = (
+                    "Trajectory skipped: no BDC releases could be loaded."
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Trajectory computation failed")
+            trajectory_note = f"Trajectory computation failed: {exc}"
 
     tract_acs = acs.frame.to_dicts() if not acs.frame.is_empty() else []
 

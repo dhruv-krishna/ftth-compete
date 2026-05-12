@@ -73,6 +73,43 @@ RUN mkdir -p /home/user/app/data/raw/ias && \
     done && \
     chown -R user:user /home/user/app/data
 
+# Pre-download TIGER state shapefiles for the most-looked-up demo
+# markets (CA / CO / KS / MO / NY / TX). Each state's TRACT + PLACE
+# zip is fetched and extracted into the dir tiger.py expects
+# (data/raw/tiger/<year>/{PLACE,TRACT}/tl_<year>_<fips>_<layer>.shp).
+# Eliminates a 30-60s cold TIGER download on the first lookup in
+# each of those states. ~120MB image-size bump for the six states.
+#
+# State FIPS:
+#   06 California · 08 Colorado · 20 Kansas · 29 Missouri
+#   36 New York   · 48 Texas
+RUN mkdir -p /home/user/app/data/raw/tiger/2024/PLACE \
+             /home/user/app/data/raw/tiger/2024/TRACT && \
+    cd /home/user/app/data/raw/tiger/2024 && \
+    for fips in 06 08 20 29 36 48; do \
+        for pair in PLACE:place TRACT:tract; do \
+            upper="${pair%:*}"; \
+            lower="${pair#*:}"; \
+            tmp="/tmp/tl_2024_${fips}_${lower}.zip"; \
+            url="https://www2.census.gov/geo/tiger/TIGER2024/${upper}/tl_2024_${fips}_${lower}.zip"; \
+            curl -fsSL -o "$tmp" "$url" \
+                && unzip -oq "$tmp" -d "${upper}/" \
+                && rm "$tmp" \
+                || echo "WARN: failed to fetch ${url}"; \
+        done; \
+    done && \
+    chown -R user:user /home/user/app/data/raw/tiger
+
+# Pre-download the national ZCTA -> tract crosswalk (~30 MB single
+# text file). Used by ACP density allocation and any other future
+# ZIP-to-tract joins. Without seeding this, the first market lookup
+# that triggers ACP density blocks on a 300s download timeout.
+RUN mkdir -p /home/user/app/data/raw/tiger/2024/ZCTA_TRACT_REL && \
+    curl -fsSL -o /home/user/app/data/raw/tiger/2024/ZCTA_TRACT_REL/tab20_zcta520_tract20_natl.txt \
+        "https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_tract20_natl.txt" \
+        || echo "WARN: failed to fetch ZCTA->tract crosswalk" \
+    ; chown -R user:user /home/user/app/data/raw/tiger
+
 # NOTE: we don't run `reflex export` at build time. The first invocation
 # of `reflex run` at container startup does the .web/ scaffold + frontend
 # build, and we get real-time logs if it errors. This costs ~2-3 min on
