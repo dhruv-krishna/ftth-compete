@@ -11,8 +11,10 @@ Methodology) remain placeholders for later phases.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, ClassVar
+from urllib.parse import quote
 
 import plotly.graph_objects as go
 import reflex as rx
@@ -32,6 +34,53 @@ from ftth_compete.narrative import (
 from ftth_compete_web import analytics
 
 log = logging.getLogger(__name__)
+
+
+def _friendly_lookup_error(exc: BaseException, city: str, state: str) -> str:
+    """Map a pipeline exception to a user-facing one-liner.
+
+    The pipeline raises a mix of `ValueError` (bad city / state) and bare
+    `Exception` from httpx, DuckDB, GeoPandas, etc. Surface the actionable
+    category instead of dumping the raw repr.
+    """
+    msg = str(exc) or exc.__class__.__name__
+    lower = msg.lower()
+    if isinstance(exc, ValueError):
+        # tiger.city_to_tracts raises with a friendly message already.
+        return msg
+    # httpx errors don't always inherit a useful base class; sniff the
+    # class name + message text to classify.
+    name = exc.__class__.__name__
+    if "Timeout" in name or "timeout" in lower or "timed out" in lower:
+        return (
+            f"A request timed out while building the {city}, {state} tear-sheet. "
+            "Try again — the slowest external sources are FCC BDC + Census; "
+            "transient timeouts are common during their peak hours."
+        )
+    if "ConnectError" in name or "ConnectionError" in name or "connection" in lower:
+        return (
+            f"Network error reaching the data sources for {city}, {state}. "
+            "Check your internet connection (or wait if Census / FCC is briefly down)."
+        )
+    if "401" in msg or "403" in msg or "Unauthorized" in name or "auth" in lower:
+        return (
+            f"Authentication error fetching data for {city}, {state}. "
+            "Verify CENSUS_API_KEY and FCC_USERNAME / FCC_API_TOKEN in .env."
+        )
+    if "404" in msg or "not found" in lower:
+        return (
+            f"A data source returned 404 for {city}, {state}. "
+            "The release may have rolled over; try `make refresh` to re-index."
+        )
+    # Pipeline returns ValueError for zero-tract resolutions, but if any
+    # downstream module raises an empty-frame issue surface that too.
+    if "empty" in lower or "no data" in lower or "no tracts" in lower:
+        return (
+            f"No usable data for {city}, {state} — the market may resolve to "
+            "zero tracts or fall outside the BDC release's coverage."
+        )
+    return f"Lookup failed for {city}, {state}: {msg}"
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -409,6 +458,42 @@ class LookupState(rx.State):
     # The v2 map is reactive: clicking a tract or provider repaints the
     # right rail. Setting one selection clears the other so the rail
     # always shows exactly one focus.
+    # Share / page-title helpers --------------------------------------
+    @rx.event
+    def share_market(self):
+        """Copy a deep-link URL for the current market to the clipboard
+        and show a confirmation toast. The URL uses the autorun flag so
+        the recipient lands directly inside the loaded market.
+
+        Built via `window.location.origin + path` in JS so it works in
+        both local dev (localhost:3000) and the HF deploy without us
+        having to know the host server-side.
+        """
+        if not self.has_result:
+            return rx.toast.error("Load a market first.")
+        city_enc = quote(self.city.strip())
+        state_enc = quote(self.state.strip().upper())
+        path = f"/v2?city={city_enc}&state={state_enc}&autorun=1"
+        js = (
+            "navigator.clipboard.writeText("
+            f"window.location.origin + {json.dumps(path)})"
+        )
+        return [
+            rx.call_script(js),
+            rx.toast.success(f"Link to {self.market_title} copied to clipboard"),
+        ]
+
+    @rx.event
+    def update_page_title(self):
+        """Set `document.title` to `<market> · ftth-compete`. Invoked
+        after each lookup so browser tab strips show which market each
+        open tab is on, instead of every tab saying `ftth-compete`.
+        """
+        if not self.market_title:
+            return rx.call_script("document.title = 'ftth-compete'")
+        title = f"{self.market_title} · ftth-compete"
+        return rx.call_script(f"document.title = {json.dumps(title)}")
+
     @rx.event
     def select_tract(self, geoid: str) -> None:
         self.selected_tract = geoid
@@ -969,16 +1054,11 @@ class LookupState(rx.State):
                 include_velocity=False,
                 include_trajectory=False,
             )
-        except ValueError as exc:
-            async with self:
-                self.is_loading = False
-                self.lookup_error = str(exc)
-            return
         except Exception as exc:  # noqa: BLE001
             log.exception("Lookup failed")
             async with self:
                 self.is_loading = False
-                self.lookup_error = f"Lookup failed: {exc}"
+                self.lookup_error = _friendly_lookup_error(exc, city, state)
             return
 
         # Paint Phase A1: KPIs + providers + housing now visible.
@@ -990,6 +1070,10 @@ class LookupState(rx.State):
             # Enrichment fires next; momentum waits until enrichment ends
             # so the two progress indicators don't pile on top of each other.
             self.enrich_loading = True
+
+        # Update the browser tab's <title> so the user sees which market
+        # each open tab is showing.
+        yield LookupState.update_page_title
 
         # Phase A2: enrichment. Re-runs run_market with IAS / speeds /
         # ratings turned on. BDC/ACS/TIGER are disk-warm so this stage
@@ -1018,7 +1102,7 @@ class LookupState(rx.State):
         async with self:
             self.momentum_loading = wants_momentum
             self.momentum_note = (
-                "Fetching take-rate trajectory..."
+                "Building take-rate trajectory (17 IAS releases)..."
                 if wants_momentum
                 else ""
             )
@@ -1063,13 +1147,14 @@ class LookupState(rx.State):
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("Subs-history backfill failed")
+            friendly = _friendly_lookup_error(exc, city, state)
             async with self:
-                self.momentum_note = f"Trajectory unavailable: {exc}"
+                self.momentum_note = f"Take-rate trajectory unavailable — {friendly}"
             # Non-fatal: continue to B2 anyway so velocity still loads.
         else:
             async with self:
                 _populate_subs_history(self, sheet)
-                self.momentum_note = "Fetching prior BDC releases..."
+                self.momentum_note = "Computing 12-month velocity + 4-release trajectory..."
 
         # Phase B2: velocity + trajectory.
         yield LookupState.backfill_momentum
@@ -1107,9 +1192,10 @@ class LookupState(rx.State):
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("Momentum backfill failed")
+            friendly = _friendly_lookup_error(exc, city, state)
             async with self:
                 self.momentum_loading = False
-                self.momentum_note = f"Momentum data unavailable: {exc}"
+                self.momentum_note = f"Momentum data unavailable — {friendly}"
             return
 
         async with self:
@@ -4407,10 +4493,19 @@ def _main_header() -> rx.Component:
         rx.vstack(
             rx.hstack(
                 rx.heading(LookupState.market_title, size="6", weight="bold"),
+                rx.button(
+                    rx.icon("link-2", size=14),
+                    "Share",
+                    on_click=LookupState.share_market,
+                    variant="soft",
+                    size="1",
+                    title="Copy a deep-link to this market",
+                ),
                 rx.spacer(),
                 rx.color_mode.button(),
                 width="100%",
                 align="center",
+                spacing="3",
             ),
             _tab_bar(),
             spacing="3",
@@ -5122,7 +5217,7 @@ def _v2_top_strip() -> rx.Component:
             rx.hstack(
                 rx.spinner(size="1"),
                 rx.text(
-                    "Loading map and data...",
+                    "Fetching take-rate anchor + measured speeds + ratings...",
                     size="1", color_scheme="gray",
                 ),
                 spacing="2",
@@ -5134,7 +5229,7 @@ def _v2_top_strip() -> rx.Component:
             rx.hstack(
                 rx.spinner(size="1"),
                 rx.text(
-                    "Loading momentum data...",
+                    LookupState.momentum_note,
                     size="1", color_scheme="gray",
                 ),
                 spacing="2",
@@ -5216,6 +5311,11 @@ def _v2_competitive_strip() -> rx.Component:
 
 def v2_page() -> rx.Component:
     return rx.vstack(
+        # Mount the Sonner toaster once at the top of the page so any
+        # event handler that returns `rx.toast.success(...)` has a
+        # rendering surface to land on. Cheap (single <Toaster /> div
+        # at app root); top-right placement keeps it out of the data.
+        rx.toast.provider(position="top-right", rich_colors=True),
         _v2_top_strip(),
         rx.hstack(
             _v2_left_rail(),
@@ -7124,29 +7224,82 @@ except Exception as exc:  # noqa: BLE001
 
 import html as _html  # local alias to avoid clobbering any `html` name
 import os as _os
+from datetime import datetime as _datetime
+from datetime import timezone as _timezone
 
 
-def _render_admin_html() -> str:
+def _rel_time(ts_str: str) -> str:
+    """Convert an ISO-8601 UTC timestamp into a short relative string.
+
+    Format ramps up by magnitude so the visitor log is glanceable:
+    "12s ago", "4m ago", "2h ago", "3d ago", or the bare date for
+    anything older than a week.
+    """
+    try:
+        ts = _datetime.fromisoformat(ts_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_timezone.utc)
+        delta = _datetime.now(_timezone.utc) - ts
+        seconds = int(delta.total_seconds())
+        if seconds < 0:
+            return "just now"
+        if seconds < 60:
+            return f"{seconds}s ago"
+        if seconds < 3600:
+            return f"{seconds // 60}m ago"
+        if seconds < 86400:
+            return f"{seconds // 3600}h ago"
+        if seconds < 86400 * 7:
+            return f"{seconds // 86400}d ago"
+        return ts.date().isoformat()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _render_admin_html(kind_filter: str = "") -> str:
     summary = analytics.summary()
-    events = analytics.recent(limit=300)
+    events = analytics.recent(limit=500)
+    if kind_filter:
+        events = [e for e in events if e.get("kind") == kind_filter]
 
     def _esc(v) -> str:
         return _html.escape(str(v if v is not None else ""))
 
     rows_html = "".join(
         f"<tr>"
-        f"<td class='nowrap'>{_esc(e['ts'])}</td>"
+        f"<td class='nowrap'><span class='rel'>{_esc(_rel_time(e['ts']))}</span>"
+        f"<br><span class='ts'>{_esc(e['ts'])}</span></td>"
         f"<td class='nowrap'>{_esc((e['session_id'] or '')[:8])}</td>"
         f"<td class='nowrap'>{_esc(e['ip_hash'] or '')}</td>"
         f"<td>{_esc(e['kind'])}</td>"
         f"<td><code>{_esc((e['payload'] or '')[:300])}</code></td>"
         f"<td class='ua'>{_esc((e['ua'] or '')[:80])}</td>"
         f"</tr>"
-        for e in events
+        for e in events[:300]
     )
+    by_kind_today = summary["by_kind_today"]
     by_kind = ", ".join(
-        f"{_esc(k)}: {n}" for k, n in summary["by_kind_today"]
+        f"{_esc(k)}: {n}" for k, n in by_kind_today
     ) or "(none)"
+
+    # Build the kind-filter chip row. Each chip carries `?key=...&kind=K`
+    # so clicking re-renders the page filtered to that event type.
+    # "All" clears the filter.
+    all_kinds = sorted({e.get("kind") for e in analytics.recent(limit=2000) if e.get("kind")})
+    key_q = _esc(_os.environ.get("ADMIN_KEY", "").strip())
+    def _chip(label: str, k: str, active: bool) -> str:
+        cls = "chip active" if active else "chip"
+        href = f"/admin?key={key_q}" if not k else f"/admin?key={key_q}&kind={_esc(k)}"
+        return f'<a class="{cls}" href="{href}">{_esc(label)}</a>'
+
+    chips = [_chip("All", "", kind_filter == "")] + [
+        _chip(k, k, kind_filter == k) for k in all_kinds
+    ]
+    chips_html = "".join(chips)
+    filter_caption = (
+        f" — filtered to <strong>{_esc(kind_filter)}</strong>"
+        if kind_filter else ""
+    )
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>ftth-compete · admin</title>
@@ -7156,17 +7309,23 @@ h1{{font-size:18px;margin:0 0 12px 0;}}
 .summary{{background:white;padding:14px 18px;border:1px solid #ddd;margin-bottom:14px;border-radius:6px;}}
 .summary div{{margin:3px 0;font-size:14px;}}
 .summary strong{{display:inline-block;min-width:200px;color:#444;}}
+.chips{{margin:14px 0 10px 0;display:flex;flex-wrap:wrap;gap:6px;}}
+.chip{{display:inline-block;padding:3px 10px;border:1px solid #cdd1d6;border-radius:14px;font-size:12px;color:#444;text-decoration:none;background:white;}}
+.chip:hover{{border-color:#888;color:#111;}}
+.chip.active{{background:#2563EB;border-color:#2563EB;color:white;}}
 table{{border-collapse:collapse;width:100%;font-size:13px;background:white;}}
 th,td{{border:1px solid #ddd;padding:6px 10px;text-align:left;vertical-align:top;}}
 th{{background:#eee;font-weight:600;position:sticky;top:0;}}
 tr:nth-child(even){{background:#f7f7f7;}}
 code{{font-size:12px;color:#555;font-family:ui-monospace,Menlo,Consolas,monospace;}}
 .nowrap{{white-space:nowrap;}}
+.rel{{font-weight:600;color:#111;}}
+.ts{{font-size:10px;color:#888;font-family:ui-monospace,Menlo,Consolas,monospace;}}
 .ua{{color:#888;font-size:11px;max-width:240px;overflow:hidden;text-overflow:ellipsis;}}
 .muted{{color:#777;font-size:12px;margin-top:6px;}}
 </style></head>
 <body>
-<h1>ftth-compete · admin sidecar</h1>
+<h1>ftth-compete · admin sidecar{filter_caption}</h1>
 <div class="summary">
   <div><strong>Sessions today (UTC)</strong> {summary['sessions_today']}</div>
   <div><strong>Distinct IPs today</strong> {summary['unique_ips_today']}</div>
@@ -7177,9 +7336,10 @@ code{{font-size:12px;color:#555;font-family:ui-monospace,Menlo,Consolas,monospac
     IPs are stored as an 8-char SHA-256 prefix, not raw.
   </div>
 </div>
+<div class="chips">{chips_html}</div>
 <table>
   <thead><tr>
-    <th>UTC timestamp</th>
+    <th>When</th>
     <th>Session</th>
     <th>IP hash</th>
     <th>Event</th>
@@ -7187,18 +7347,20 @@ code{{font-size:12px;color:#555;font-family:ui-monospace,Menlo,Consolas,monospac
     <th>User-Agent</th>
   </tr></thead>
   <tbody>
-    {rows_html or '<tr><td colspan="6" class="muted">No events yet.</td></tr>'}
+    {rows_html or '<tr><td colspan="6" class="muted">No events match the current filter.</td></tr>'}
   </tbody>
 </table>
 </body></html>"""
 
 
 async def _serve_admin(request: Request) -> Response:
-    """GET /admin?key=<ADMIN_KEY>
+    """GET /admin?key=<ADMIN_KEY>&kind=<event_kind>
 
     Wrong or missing key returns 404 (indistinguishable from "no such
     route"). If ADMIN_KEY env var is unset, the route is disabled
-    entirely — same 404 response.
+    entirely — same 404 response. Optional `kind=` query param filters
+    rows to just that event type (clickable chips at the top of the
+    page provide the UI affordance for this).
     """
     expected = _os.environ.get("ADMIN_KEY", "").strip()
     given = (request.query_params.get("key", "") or "").strip()
@@ -7208,7 +7370,8 @@ async def _serve_admin(request: Request) -> Response:
             media_type="text/html",
             status_code=404,
         )
-    return Response(content=_render_admin_html(), media_type="text/html")
+    kind_filter = (request.query_params.get("kind", "") or "").strip()
+    return Response(content=_render_admin_html(kind_filter), media_type="text/html")
 
 
 try:
