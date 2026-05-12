@@ -4493,19 +4493,10 @@ def _main_header() -> rx.Component:
         rx.vstack(
             rx.hstack(
                 rx.heading(LookupState.market_title, size="6", weight="bold"),
-                rx.button(
-                    rx.icon("link-2", size=14),
-                    "Share",
-                    on_click=LookupState.share_market,
-                    variant="soft",
-                    size="1",
-                    title="Copy a deep-link to this market",
-                ),
                 rx.spacer(),
                 rx.color_mode.button(),
                 width="100%",
                 align="center",
-                spacing="3",
             ),
             _tab_bar(),
             spacing="3",
@@ -5179,6 +5170,21 @@ def _v2_top_strip() -> rx.Component:
                 LookupState.has_result,
                 rx.text(LookupState.market_title, size="4", weight="bold"),
                 rx.text("ftth-compete", size="4", weight="bold"),
+            ),
+            # Share-link button. Only renders once a market is loaded
+            # (gated on `has_result` via rx.cond above being the sibling
+            # text, but this button needs its own cond so it disappears
+            # on the empty-state landing).
+            rx.cond(
+                LookupState.has_result,
+                rx.button(
+                    rx.icon("link-2", size=14),
+                    "Share",
+                    on_click=LookupState.share_market,
+                    variant="soft",
+                    size="1",
+                    title="Copy a deep-link to this market",
+                ),
             ),
             spacing="2",
             align="center",
