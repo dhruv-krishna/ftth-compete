@@ -110,11 +110,25 @@ RUN mkdir -p /home/user/app/data/raw/tiger/2024/ZCTA_TRACT_REL && \
         || echo "WARN: failed to fetch ZCTA->tract crosswalk" \
     ; chown -R user:user /home/user/app/data/raw/tiger
 
-# NOTE: we don't run `reflex export` at build time. The first invocation
-# of `reflex run` at container startup does the .web/ scaffold + frontend
-# build, and we get real-time logs if it errors. This costs ~2-3 min on
-# first container start (subsequent starts reuse the built .web/), but
-# avoids the opaque build-time failures we hit otherwise.
+# Pre-build the frontend at image build time.
+#
+# Without this, the first invocation of `reflex run --env prod
+# --frontend-only` at CMD time spends 60-90s scaffolding `.web/` and
+# compiling the Next.js production bundle. Doing it here moves that
+# cost to `docker build` (where we don't care) and lets every cold
+# container start serve traffic in seconds rather than minutes.
+#
+# `reflex init --loglevel info` is a no-op if the project's already
+# set up but ensures the .web/ scaffold is in place before export.
+# `reflex export --frontend-only --no-zip` writes the static export
+# to `.web/_static/` which `reflex run --env prod --frontend-only`
+# will then serve directly without re-building.
+#
+# RUN runs as root by default; chown the resulting .web/ tree so the
+# uid 1000 runtime user can read it.
+RUN uv run reflex init --loglevel info \
+    && uv run reflex export --frontend-only --no-zip --loglevel info \
+    && chown -R user:user /home/user/app/.web
 
 # HF Spaces expects port 7860.
 ENV PORT=7860

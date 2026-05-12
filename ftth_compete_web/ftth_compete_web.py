@@ -24,7 +24,7 @@ from ftth_compete.analysis.lenses import Lens, market_opportunity
 from ftth_compete.analysis.lenses import apply as apply_lens
 from ftth_compete.data.tiger import STATE_FIPS
 from ftth_compete.format import fmt_currency, fmt_int, fmt_pct, fmt_speed
-from ftth_compete.pipeline import run_market
+from ftth_compete.pipeline import momentum_for_market, run_market
 from ftth_compete.narrative import (
     availability_share,
     fiber_availability_share,
@@ -34,6 +34,46 @@ from ftth_compete.narrative import (
 from ftth_compete_web import analytics
 
 log = logging.getLogger(__name__)
+
+
+# Module-level cache for `ProviderSummary` stubs keyed by market title.
+# `_recompute_visible_providers` is called on every filter / lens /
+# incumbent change; rebuilding ~50 frozen dataclasses from dicts on each
+# click is wasted CPU. The stubs only change when `providers_data` does
+# (i.e. on a new lookup), so we key by (market_title, len(providers_data))
+# and evict the oldest market when the cache fills.
+_PROVIDER_STUB_CACHE: dict[tuple[str, int], list[ProviderSummary]] = {}
+_PROVIDER_STUB_CACHE_MAX = 16
+
+
+def _get_provider_stubs(
+    market_title: str, rows: list[dict[str, Any]]
+) -> list[ProviderSummary]:
+    key = (market_title, len(rows))
+    cached = _PROVIDER_STUB_CACHE.get(key)
+    if cached is not None:
+        return cached
+    stubs = [
+        ProviderSummary(
+            canonical_name=r["name"],
+            holding_company=r["holding"],
+            category=r["category_key"],
+            technology=r["tech_label"],
+            tech_code=int(r["tech_code"]),
+            tracts_served=int(r.get("tracts_served") or 0),
+            coverage_pct=float(r.get("coverage_pct") or 0.0),
+            locations_served=int(r.get("n_locations") or 0),
+            has_fiber=bool(r.get("has_fiber")),
+            max_advertised_down=r.get("_max_down_raw"),
+            max_advertised_up=r.get("_max_up_raw"),
+            raw_brand_names=list(r.get("_raw_brands") or []),
+        )
+        for r in rows
+    ]
+    if len(_PROVIDER_STUB_CACHE) >= _PROVIDER_STUB_CACHE_MAX:
+        _PROVIDER_STUB_CACHE.pop(next(iter(_PROVIDER_STUB_CACHE)))
+    _PROVIDER_STUB_CACHE[key] = stubs
+    return stubs
 
 
 def _friendly_lookup_error(exc: BaseException, city: str, state: str) -> str:
@@ -853,24 +893,10 @@ class LookupState(rx.State):
         # Lens re-scoring. Reconstruct minimal ProviderSummary instances
         # from stored dicts so we can call apply_lens(); cheaper than
         # serializing the original objects through Reflex state.
+        # Stubs are module-cached per market — every filter / lens flip
+        # reuses the same list instead of rebuilding 50 dataclasses.
         if self.lens != "neutral":
-            stubs = [
-                ProviderSummary(
-                    canonical_name=r["name"],
-                    holding_company=r["holding"],
-                    category=r["category_key"],
-                    technology=r["tech_label"],
-                    tech_code=int(r["tech_code"]),
-                    tracts_served=int(r.get("tracts_served") or 0),
-                    coverage_pct=float(r.get("coverage_pct") or 0.0),
-                    locations_served=int(r.get("n_locations") or 0),
-                    has_fiber=bool(r.get("has_fiber")),
-                    max_advertised_down=r.get("_max_down_raw"),
-                    max_advertised_up=r.get("_max_up_raw"),
-                    raw_brand_names=list(r.get("_raw_brands") or []),
-                )
-                for r in rows
-            ]
+            stubs = _get_provider_stubs(self.market_title, rows)
             scored = apply_lens(
                 stubs,
                 self.lens,
@@ -1117,12 +1143,13 @@ class LookupState(rx.State):
     # --- Follow-up: backfill historical IAS take-rate trajectory (B1) -
     @rx.event(background=True)
     async def backfill_subs_history(self):
-        """Fetch the multi-release IAS subscription history and paint
-        the trendline sparkline on the Overview tab.
+        """Phase B1 — fetch IAS take-rate trajectory only.
 
-        Light vs B2: needs ~17 small IAS release parquets (~200-450KB
-        each). On a warm cache: sub-second. Cold: ~1-2min total.
-        The 14-release seed bundle keeps cold containers near-warm.
+        Uses `pipeline.momentum_for_market(include_velocity=False,
+        include_trajectory=False, include_subs_history=True)` so we
+        don't re-fetch ACS / current BDC / Ookla / Places / IAS anchor
+        / ACP — all of which were already populated in Phases A1+A2.
+        Just resolves geoids and fetches the 17 IAS releases.
         """
         async with self:
             if not self.has_result:
@@ -1130,17 +1157,13 @@ class LookupState(rx.State):
             city = self.city.strip()
             state = self.state.strip().upper()
             include_boundary = self.include_boundary
-            no_speeds = self.no_speeds
-            no_ratings = self.no_ratings
 
         try:
-            sheet = await asyncio.to_thread(
-                run_market,
+            momentum = await asyncio.to_thread(
+                momentum_for_market,
                 city,
                 state,
                 include_boundary=include_boundary,
-                no_speeds=no_speeds,
-                no_ratings=no_ratings,
                 include_velocity=False,
                 include_trajectory=False,
                 include_subs_history=True,
@@ -1153,7 +1176,7 @@ class LookupState(rx.State):
             # Non-fatal: continue to B2 anyway so velocity still loads.
         else:
             async with self:
-                _populate_subs_history(self, sheet)
+                _populate_momentum(self, momentum)
                 self.momentum_note = "Computing 12-month velocity + 4-release trajectory..."
 
         # Phase B2: velocity + trajectory.
@@ -1162,12 +1185,14 @@ class LookupState(rx.State):
     # --- Follow-up: backfill velocity + trajectory (B2) ----------------
     @rx.event(background=True)
     async def backfill_momentum(self):
-        """Re-run `run_market` with velocity + trajectory enabled and
-        merge the momentum-only fields into the already-populated rows.
+        """Phase B2 — fetch velocity + trajectory only.
 
-        Heavy: needs 1-4 extra BDC release parquets (~5min each cold).
-        The base data is already warm-cached so this is the only added
-        wait. Failures surface as `momentum_note` text — non-fatal.
+        Uses `pipeline.momentum_for_market(include_velocity=True,
+        include_trajectory=True, include_subs_history=False)` so the
+        ~5 min cold BDC release fetches don't drag along a full
+        re-ingest of the base sheet. Per-release fetches run
+        concurrently in a ThreadPoolExecutor inside the pipeline.
+        Failures surface as `momentum_note` text — non-fatal.
         """
         async with self:
             if not self.has_result:
@@ -1175,20 +1200,16 @@ class LookupState(rx.State):
             city = self.city.strip()
             state = self.state.strip().upper()
             include_boundary = self.include_boundary
-            no_speeds = self.no_speeds
-            no_ratings = self.no_ratings
 
         try:
-            sheet = await asyncio.to_thread(
-                run_market,
+            momentum = await asyncio.to_thread(
+                momentum_for_market,
                 city,
                 state,
                 include_boundary=include_boundary,
-                no_speeds=no_speeds,
-                no_ratings=no_ratings,
                 include_velocity=True,
                 include_trajectory=True,
-                include_subs_history=True,
+                include_subs_history=False,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("Momentum backfill failed")
@@ -1199,11 +1220,7 @@ class LookupState(rx.State):
             return
 
         async with self:
-            # Re-run the full populate — cheap relative to BDC fetch — so
-            # velocity badges + trajectory sparklines + the Overview
-            # "12-month fiber footprint change" panel all refresh in one
-            # shot. Safe because Phase A's sheet had the same base data.
-            _populate_from_sheet(self, sheet)
+            _populate_momentum(self, momentum)
             self.momentum_loading = False
             self.momentum_note = ""
 
@@ -2484,6 +2501,109 @@ def _humanize_release_label(as_of: str) -> str:
     yyyy, mm = as_of[:4], as_of[5:7]
     mon = {"06": "Jun", "12": "Dec"}.get(mm, mm)
     return f"{mon} {yyyy}"
+
+
+def _populate_momentum(s: LookupState, momentum: dict[str, Any]) -> None:
+    """Apply momentum-only updates from `pipeline.momentum_for_market()`
+    onto an already-populated state without touching base fields.
+
+    `momentum` keys: provider_velocity, velocity_note, provider_trajectory,
+    trajectory_note, market_subscription_history, subs_history_note.
+
+    Mirrors the velocity / trajectory bits of `_populate_from_sheet` but
+    leaves KPIs, providers_data shape, IAS anchor, Ookla speeds, etc.
+    untouched — they were set in Phase A1 + A2 and don't need rebuilding.
+    """
+    velocity_rows = list(momentum.get("provider_velocity") or [])
+    trajectory_rows = list(momentum.get("provider_trajectory") or [])
+
+    # Velocity highlights (fiber-only top 3 growers + decliners).
+    fiber_velos = [v for v in velocity_rows if v.get("tech_code") == 50]
+    growers = sorted(
+        (v for v in fiber_velos if (v.get("delta_abs") or 0) > 0),
+        key=lambda v: -v["delta_abs"],
+    )[:3]
+    decliners = sorted(
+        (v for v in fiber_velos if (v.get("delta_abs") or 0) < 0),
+        key=lambda v: v["delta_abs"],
+    )[:3]
+
+    def _velo_row(v: dict) -> dict[str, Any]:
+        name = str(v.get("canonical_name") or "")
+        delta = int(v.get("delta_abs") or 0)
+        pct = v.get("delta_pct")
+        prev_locs = int(v.get("prev_locations") or 0)
+        cur_locs = int(v.get("current_locations") or 0)
+        is_new = bool(v.get("new_offering"))
+        is_disc = bool(v.get("discontinued"))
+        pct_str = f"{pct:+.0%}" if pct is not None else "—"
+        if is_new:
+            badge_label, badge_color = "NEW", "green"
+        elif is_disc:
+            badge_label, badge_color = "Discontinued", "red"
+        elif delta > 0:
+            badge_label, badge_color = f"+{delta:,}", "green"
+        else:
+            badge_label, badge_color = f"{delta:,}", "orange"
+        detail = f"{pct_str}  ({prev_locs:,} → {cur_locs:,} locations)"
+        return {
+            "name": name,
+            "badge_label": badge_label,
+            "badge_color": badge_color,
+            "detail": detail,
+        }
+
+    s.velocity_growers = [_velo_row(v) for v in growers]
+    s.velocity_decliners = [_velo_row(v) for v in decliners]
+    if growers or decliners:
+        ref = growers[0] if growers else decliners[0]
+        s.velocity_release_label = (
+            f"BDC {ref.get('prev_release', '?')} → {ref.get('current_release', '?')}"
+        )
+    else:
+        s.velocity_release_label = ""
+
+    # Merge per-row velocity + trajectory into existing providers_data
+    # (the rows themselves were populated by Phase A; we just enrich
+    # them in place).
+    velocity_by_key = {
+        (v.get("canonical_name"), int(v.get("tech_code") or 0)): v
+        for v in velocity_rows
+    }
+    trajectory_by_key = {
+        (t.get("canonical_name"), int(t.get("tech_code") or 0)): t
+        for t in trajectory_rows
+    }
+    updated_rows = []
+    for r in s.providers_data:
+        new_r = dict(r)
+        key = (new_r["name"], int(new_r["tech_code"]))
+        v = velocity_by_key.get(key)
+        if v:
+            new_r.update(_format_velocity(v))
+        t = trajectory_by_key.get(key)
+        if t:
+            new_r.update(_format_trajectory(t))
+        updated_rows.append(new_r)
+    s.providers_data = updated_rows
+    # Re-apply current filter / lens / sort with the enriched rows.
+    s._recompute_visible_providers()
+
+    # Subscription-history sparkline — same logic as _populate_subs_history
+    # but reading from the momentum dict instead of a TearSheet.
+    sub_points = list(momentum.get("market_subscription_history") or [])
+    sub_note = momentum.get("subs_history_note") or ""
+    if sub_points:
+        # Build a temporary namespace mimicking the relevant TearSheet
+        # surface and reuse _populate_subs_history's logic.
+        from types import SimpleNamespace
+        s_sheet = SimpleNamespace(
+            market_subscription_history=sub_points,
+            subs_history_note=sub_note,
+        )
+        _populate_subs_history(s, s_sheet)
+    else:
+        s.subs_history_note = sub_note
 
 
 def _populate_housing(s: LookupState, sheet) -> None:
@@ -4894,6 +5014,78 @@ def _v2_take_rate_trajectory() -> rx.Component:
     )
 
 
+def _skeleton_bar(height: str = "10px", width: str = "100%") -> rx.Component:
+    """Single skeleton placeholder bar with Tailwind's pulse animation.
+    Used by `_v2_skeleton_panel` + `_v2_hero_chip_skeleton` to fill the
+    right rail and KPI strip during Phase A1 so users see a shape of
+    what's coming instead of empty space."""
+    return rx.box(
+        class_name="animate-pulse",
+        style={
+            "background": "var(--gray-a4)",
+            "border_radius": "4px",
+            "height": height,
+            "width": width,
+        },
+    )
+
+
+def _v2_skeleton_panel() -> rx.Component:
+    """Loading-state placeholder mirroring the market-summary panel.
+    Renders inside the right rail while `is_loading` is true and
+    `has_result` is not yet set — i.e. during Phase A1 of the lookup."""
+    return rx.vstack(
+        # Section title + narrative placeholder.
+        _skeleton_bar("11px", "35%"),
+        rx.vstack(
+            _skeleton_bar("11px", "95%"),
+            _skeleton_bar("11px", "100%"),
+            _skeleton_bar("11px", "75%"),
+            spacing="2",
+            width="100%",
+        ),
+        rx.divider(margin_y="2"),
+        # Headline-metrics placeholder (six rows).
+        _skeleton_bar("11px", "35%"),
+        *[
+            rx.hstack(
+                _skeleton_bar("11px", "55%"),
+                rx.spacer(),
+                _skeleton_bar("11px", "25%"),
+                width="100%",
+                align="center",
+            )
+            for _ in range(6)
+        ],
+        rx.divider(margin_y="2"),
+        # Top-providers placeholder (four rows).
+        _skeleton_bar("11px", "35%"),
+        *[
+            rx.hstack(
+                _skeleton_bar("14px", "60%"),
+                rx.spacer(),
+                _skeleton_bar("11px", "20%"),
+                width="100%",
+                align="center",
+            )
+            for _ in range(4)
+        ],
+        spacing="3",
+        align="stretch",
+        width="100%",
+    )
+
+
+def _v2_hero_chip_skeleton() -> rx.Component:
+    """Top-strip placeholder chip — narrow gray bar where a KPI will go."""
+    return rx.vstack(
+        _skeleton_bar("9px", "32px"),
+        _skeleton_bar("13px", "44px"),
+        spacing="1",
+        align="start",
+    )
+
+
 def _v2_market_summary_panel() -> rx.Component:
     """Default right-rail view: narrative + hero KPIs + provider ranking +
     opportunity score. The 'cover story' of the market."""
@@ -4960,9 +5152,16 @@ def _v2_market_summary_panel() -> rx.Component:
             align="stretch",
             width="100%",
         ),
-        rx.text(
-            "No market loaded.",
-            size="2", color_scheme="gray",
+        rx.cond(
+            # Show skeleton placeholders during Phase A1 (loading, no
+            # result yet) so the right rail feels alive instead of
+            # blank. Empty state still renders before any lookup.
+            LookupState.is_loading,
+            _v2_skeleton_panel(),
+            rx.text(
+                "No market loaded.",
+                size="2", color_scheme="gray",
+            ),
         ),
     )
 
@@ -5215,6 +5414,19 @@ def _v2_top_strip() -> rx.Component:
                 _v2_hero_chip("MDU", LookupState.mdu_share_display),
                 spacing="4",
                 align="center",
+            ),
+            rx.cond(
+                # Phase A1 placeholder chips so the strip doesn't pop
+                # in when the data lands.
+                LookupState.is_loading,
+                rx.hstack(
+                    _v2_hero_chip_skeleton(),
+                    _v2_hero_chip_skeleton(),
+                    _v2_hero_chip_skeleton(),
+                    _v2_hero_chip_skeleton(),
+                    spacing="4",
+                    align="center",
+                ),
             ),
         ),
         rx.spacer(),

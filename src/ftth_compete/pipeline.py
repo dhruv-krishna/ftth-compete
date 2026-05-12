@@ -602,3 +602,228 @@ def _run_market_cached(
             "ias": market_subs_anchor_dict.get("ias_release") if market_subs_anchor_dict else None,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Momentum-only path (Phase B2 fast path)
+#
+# Callers that already have a populated TearSheet for a market (Phase A
+# of the Reflex `/v2` lookup) can re-call run_market with the momentum
+# flags on — but that wastes ~20-50s re-fetching ACS, current-release
+# BDC, Ookla, ratings, IAS, and ACP density. None of those change for
+# the momentum analyses (velocity + trajectory + subs history); they
+# only need the geoids, current BDC providers (already in the
+# in-process parquet cache after Phase A), and the prior BDC releases.
+#
+# `momentum_for_market` does only that work and returns a dict of just
+# the momentum-related field updates. The Reflex layer merges this into
+# the existing state via `_populate_momentum` without disturbing KPIs,
+# providers, ratings, etc.
+
+
+def momentum_for_market(
+    city: str,
+    state: str,
+    *,
+    include_boundary: bool = False,
+    include_velocity: bool = True,
+    include_trajectory: bool = True,
+    trajectory_points: int = 4,
+    include_subs_history: bool = True,
+) -> dict[str, Any]:
+    """Compute momentum-only fields for an already-loaded market.
+
+    Returns a dict with keys matching the relevant TearSheet fields:
+    `provider_velocity`, `velocity_note`, `provider_trajectory`,
+    `trajectory_note`, `market_subscription_history`, `subs_history_note`.
+
+    Cheap when the disk caches are warm (current release already loaded
+    by Phase A). The slow piece is fetching prior BDC releases for
+    trajectory — those run concurrently via ThreadPoolExecutor.
+    """
+    settings = get_settings()
+    settings.ensure_dirs()
+
+    out: dict[str, Any] = {
+        "provider_velocity": [],
+        "velocity_note": None,
+        "provider_trajectory": [],
+        "trajectory_note": None,
+        "market_subscription_history": [],
+        "subs_history_note": None,
+    }
+
+    # 1) Resolve geoids (TIGER) — fast, disk-cached after Phase A.
+    _emit(f"Momentum: resolving {city}, {state}...")
+    try:
+        res = tiger.city_to_tracts(city, state)
+    except ValueError as exc:
+        out["velocity_note"] = f"Momentum skipped: {exc}"
+        out["trajectory_note"] = out["velocity_note"]
+        out["subs_history_note"] = out["velocity_note"]
+        return out
+    geoids = list(res.geoids)
+    if include_boundary:
+        geoids.extend(res.boundary_tract_geoids)
+
+    # 2) Re-resolve current BDC providers. The parquet is already on
+    # disk from Phase A so this is the polars score() step, ~1s warm.
+    bdc_release: str | None = None
+    current_providers: list[ProviderSummary] | None = None
+    if include_velocity or include_trajectory:
+        if not (settings.fcc_username and settings.fcc_api_token):
+            note = (
+                "Momentum skipped: FCC_USERNAME / FCC_API_TOKEN not set. "
+                "Register at https://apps.fcc.gov/cores/userLogin.do."
+            )
+            out["velocity_note"] = note
+            out["trajectory_note"] = note
+        else:
+            try:
+                bdc_release = fcc_bdc.latest_release()
+                coverage = fcc_bdc.coverage_matrix(geoids, as_of=bdc_release)
+                current_providers = competitors_mod.score(
+                    coverage, n_tracts=len(geoids),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Momentum: current BDC re-resolve failed")
+                err = f"Momentum skipped: {exc}"
+                out["velocity_note"] = err
+                out["trajectory_note"] = err
+
+    # 3) Subs history is independent of BDC and runs in parallel below.
+
+    # 4) Compute the set of prior BDC releases we need.
+    needed_releases: set[str] = set()
+    prev_release: str | None = None
+    trajectory_release_list: list[str] = []
+
+    if include_velocity and current_providers and bdc_release:
+        try:
+            prev_release = fcc_bdc.previous_release(bdc_release, months_back=12)
+            needed_releases.add(prev_release)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Momentum: previous_release lookup failed")
+            out["velocity_note"] = f"Velocity skipped: {exc}"
+
+    if include_trajectory and current_providers and bdc_release:
+        try:
+            trajectory_release_list = list(
+                fcc_bdc.trajectory_releases(
+                    bdc_release, n_points=trajectory_points, months_step=6,
+                )
+            )
+            needed_releases.update(
+                r for r in trajectory_release_list if r != bdc_release
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Momentum: trajectory_releases lookup failed")
+            out["trajectory_note"] = f"Trajectory skipped: {exc}"
+
+    # 5) Fetch prior releases concurrently + subs history in the same
+    # ThreadPoolExecutor so all the slow I/O overlaps.
+    release_snapshots: dict[str, list[ProviderSummary]] = {}
+    if current_providers and bdc_release:
+        release_snapshots[bdc_release] = current_providers
+
+    subs_history_rows: list[dict[str, Any]] = []
+    subs_history_err: str | None = None
+
+    if needed_releases or include_subs_history:
+        def _fetch_release(rel: str):
+            cov = fcc_bdc.coverage_matrix(geoids, as_of=rel)
+            return rel, competitors_mod.score(cov, n_tracts=len(geoids))
+
+        def _fetch_subs_history():
+            try:
+                points = fcc_ias.market_subscription_history(geoids)
+                return [asdict(p) for p in points], None
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Momentum: subs history fetch failed")
+                return [], f"Subscription history failed: {exc}"
+
+        max_workers = max(1, len(needed_releases) + (1 if include_subs_history else 0))
+        with ThreadPoolExecutor(max_workers=min(max_workers, 5)) as pool:
+            release_futures = {
+                pool.submit(_fetch_release, r): r for r in needed_releases
+            }
+            subs_future = (
+                pool.submit(_fetch_subs_history)
+                if include_subs_history else None
+            )
+            for fut, rel in release_futures.items():
+                try:
+                    rel_out, snap = fut.result()
+                    release_snapshots[rel_out] = snap
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("Momentum: BDC release %s failed", rel)
+                    _ = exc  # surfaced via velocity/trajectory notes below
+            if subs_future is not None:
+                try:
+                    subs_history_rows, subs_history_err = subs_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("Momentum: subs history thread crashed")
+                    subs_history_err = f"Subscription history failed: {exc}"
+
+    # 6) Compute velocity from snapshots.
+    if (
+        include_velocity and prev_release and current_providers and bdc_release
+        and out["velocity_note"] is None
+    ):
+        if prev_release in release_snapshots:
+            try:
+                velocity = velocity_mod.compute(
+                    current_providers, release_snapshots[prev_release],
+                    current_release=bdc_release, prev_release=prev_release,
+                )
+                out["provider_velocity"] = [asdict(v) for v in velocity]
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Velocity computation failed")
+                out["velocity_note"] = f"Velocity computation failed: {exc}"
+        else:
+            out["velocity_note"] = (
+                f"Velocity skipped: prior BDC release {prev_release} "
+                "could not be loaded."
+            )
+
+    # 7) Compute trajectory from snapshots.
+    if (
+        include_trajectory and trajectory_release_list
+        and current_providers and bdc_release
+        and out["trajectory_note"] is None
+    ):
+        try:
+            snapshots = [
+                (rel, release_snapshots[rel])
+                for rel in trajectory_release_list
+                if rel in release_snapshots
+            ]
+            if snapshots:
+                trajectory = trajectory_mod.compute(snapshots)
+                out["provider_trajectory"] = [
+                    {
+                        "canonical_name": t.canonical_name,
+                        "technology": t.technology,
+                        "tech_code": t.tech_code,
+                        "series": [
+                            {"release": pt.release, "locations": pt.locations}
+                            for pt in t.series
+                        ],
+                    }
+                    for t in trajectory
+                ]
+            else:
+                out["trajectory_note"] = (
+                    "Trajectory skipped: no BDC releases could be loaded."
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Trajectory computation failed")
+            out["trajectory_note"] = f"Trajectory computation failed: {exc}"
+
+    # 8) Surface subs history result.
+    if include_subs_history:
+        out["market_subscription_history"] = subs_history_rows
+        if subs_history_err:
+            out["subs_history_note"] = subs_history_err
+
+    return out
