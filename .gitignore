@@ -1,0 +1,60 @@
+assets/external/
+.states
+.web
+*.db
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Envs
+.venv/
+.env
+.env.cloud
+.env.*.local
+
+# Project data — large bulk downloads, not committed
+data/raw/
+data/processed/
+data/cache.db
+data/cache.db-*
+*.parquet
+# Cloud cold-start seeds used to live under `data/seed/` and ship in
+# git, but HF Spaces rejects every binary file (any size, not just
+# >10MB) without Xet/LFS — so the IAS history bundle is downloaded at
+# Docker build time instead (see Dockerfile). Keep this directory
+# gitignored so a local dev cache can land here without being staged.
+data/seed/
+
+# Editor / OS
+.vscode/
+.idea/
+# Local-only editor/tooling dir (real docs are tracked under docs/)
+.claude/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+*.egg
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs (FCC API URLs sometimes contain hash_value tokens — never commit)
+*.log
+
+# Generated artifacts / debug dumps
+exports/
+scripts/_v2_map_test.html
+evans_*.json
+*_tearsheet.json
+*_tearsheet.pdf
+
+# uv lockfile is fine to commit, but exclude any local override
+.python-version

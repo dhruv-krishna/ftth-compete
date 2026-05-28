@@ -1,0 +1,62 @@
+name: deploy
+
+# Mirrors `main` to a Hugging Face Spaces git remote on every push.
+# HF builds and runs the Docker image server-side, gives us a public URL
+# (`https://<HF_USERNAME>-<HF_SPACE>.hf.space`), and rebuilds on every
+# push automatically. The user's corporate-network SSL block doesn't
+# matter — the deploy runs on GitHub's Ubuntu runner, not their laptop.
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   HF_USERNAME   — your Hugging Face username (e.g. "dhruvkrishna")
+#   HF_SPACE      — the Space name you created (e.g. "ftth-compete")
+#   HF_TOKEN      — write-access HF access token (huggingface.co →
+#                   Settings → Access Tokens → New token w/ Write scope)
+#
+# Also configure these as HF Space Secrets (in the Space's own Settings
+# UI on huggingface.co) so the runtime container can call FCC + Census:
+#   CENSUS_API_KEY
+#   FCC_USERNAME
+#   FCC_API_TOKEN
+#   GOOGLE_PLACES_KEY (optional)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sync-to-hf:
+    name: Push to Hugging Face Spaces
+    runs-on: ubuntu-latest
+    concurrency:
+      group: hf-deploy
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout (full history — required for force-push)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to Hugging Face Spaces
+        env:
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}
+          HF_SPACE: ${{ secrets.HF_SPACE }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_USERNAME" ] || [ -z "$HF_SPACE" ] || [ -z "$HF_TOKEN" ]; then
+            echo "Missing one of HF_USERNAME / HF_SPACE / HF_TOKEN GitHub secrets."
+            echo "Set them under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          git config user.email "ci@github.actions"
+          git config user.name "ftth-compete CI"
+          # HF Spaces use git as the deploy mechanism; the URL embeds
+          # the token for HTTPS auth.
+          HF_URL="https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE}"
+          git remote add hf "$HF_URL" 2>/dev/null || git remote set-url hf "$HF_URL"
+          # Force-push because the HF repo starts with one auto-generated
+          # commit that we don't care about. After the first push, future
+          # pushes are clean fast-forwards.
+          git push --force hf main
