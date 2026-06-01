@@ -19,7 +19,9 @@ Tract GEOID is the first 11 chars; that's how we aggregate.
 from __future__ import annotations
 
 import functools
+import json
 import logging
+import time
 import zipfile
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -145,7 +147,44 @@ def _get(path: str, *, timeout: float = 30.0) -> Any:
     raise RuntimeError(f"BDC GET {path} failed after {len(backoffs) + 1} attempts.")
 
 
-@functools.lru_cache(maxsize=1)
+class _StaleFileIdError(RuntimeError):
+    """Raised when FCC returns 422 'file_id is invalid' on downloadFile.
+
+    FCC retires file_ids when it revises a release listing; an in-process
+    cache holding the old IDs then 422s on every download until invalidated.
+    ingest_state catches this, clears the listAvailabilityData /
+    listAsOfDates caches, and retries once with fresh IDs.
+    """
+
+
+def _ttl_cache(seconds: float):
+    """Tiny TTL cache decorator for module-level API helpers.
+
+    Like functools.lru_cache, but entries expire after `seconds` so a
+    long-running worker picks up new FCC releases and listing revisions
+    without needing a container restart.
+    """
+    def decorator(fn):
+        cache: dict[tuple, tuple[float, Any]] = {}
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            now = time.monotonic()
+            entry = cache.get(key)
+            if entry is not None and now - entry[0] < seconds:
+                return entry[1]
+            value = fn(*args, **kwargs)
+            cache[key] = (now, value)
+            return value
+
+        wrapper.cache_clear = cache.clear
+        return wrapper
+
+    return decorator
+
+
+@_ttl_cache(seconds=30 * 60)
 def _list_as_of_dates_cached() -> tuple[dict[str, Any], ...]:
     body = _get("/listAsOfDates")
     data = body.get("data") if isinstance(body, dict) else body
@@ -159,7 +198,7 @@ def list_as_of_dates() -> list[dict[str, Any]]:
     return list(_list_as_of_dates_cached())
 
 
-@functools.lru_cache(maxsize=16)
+@_ttl_cache(seconds=2 * 60 * 60)
 def _list_availability_data_cached(as_of: str) -> tuple[dict[str, Any], ...]:
     body = _get(f"/downloads/listAvailabilityData/{as_of}", timeout=60.0)
     data = body.get("data") if isinstance(body, dict) else body
@@ -270,7 +309,6 @@ def trajectory_releases(
     return out
 
 
-@functools.lru_cache(maxsize=2)
 def latest_release(*, with_files: bool = True) -> str:
     """Return the most recent as_of date string.
 
@@ -279,8 +317,10 @@ def latest_release(*, with_files: bool = True) -> str:
     recent release dates are sometimes published before their files are,
     so the freshest *usable* release lags by ~1 month.
 
-    Cached in-process — concurrent screener workers all call this and
-    would otherwise burn the FCC's 10/min rate budget instantly.
+    Relies on the TTL-cached _list_as_of_dates_cached and
+    _list_availability_data_cached so concurrent screener workers stay
+    well within the FCC's 10/min rate budget while still picking up new
+    releases without a process restart.
     """
     dates = list_as_of_dates()
     if not dates:
@@ -381,6 +421,24 @@ def download_file(
                 f"BDC downloadFile returned 405. URL: {url}. "
                 "Verify data_type / file_type_num path segments."
             )
+        if r.status_code == 422:
+            # FCC returns 422 with body like {"message":"<id> -> File Id: the
+            # file_id is invalid"} when a cached file_id refers to a file
+            # that was retired in a release revision. Distinguish that case
+            # from other 422s so ingest_state can self-heal.
+            body = r.read()
+            try:
+                msg = json.loads(body).get("message") or ""
+            except (ValueError, AttributeError):
+                msg = body.decode(errors="replace")[:300]
+            if "file_id is invalid" in msg.lower():
+                raise _StaleFileIdError(
+                    f"FCC retired file_id={file_id} (likely a release revision). "
+                    f"Server: {msg}"
+                )
+            raise RuntimeError(
+                f"BDC downloadFile 422 for file_id={file_id}: {msg}. URL: {url}"
+            )
         r.raise_for_status()
         with dest.open("wb") as f:
             for chunk in r.iter_bytes(chunk_size=1 << 20):
@@ -473,7 +531,26 @@ def ingest_state(state: str, as_of: str | None = None) -> Path:
 
     Returns the path to the resulting parquet file. Idempotent: if the
     parquet already exists it's returned without re-downloading.
+
+    Self-heals on FCC release revisions: if any download returns 422
+    'file_id is invalid' (FCC retired the file_id when revising the release
+    listing), clears the in-process API caches and retries once with fresh
+    file_ids.
     """
+    try:
+        return _ingest_state_impl(state, as_of)
+    except _StaleFileIdError as exc:
+        log.warning(
+            "Stale BDC file_id during ingest (state=%s): %s. "
+            "Clearing FCC API caches and retrying once.",
+            state, exc,
+        )
+        _list_as_of_dates_cached.cache_clear()
+        _list_availability_data_cached.cache_clear()
+        return _ingest_state_impl(state, as_of)
+
+
+def _ingest_state_impl(state: str, as_of: str | None) -> Path:
     fips = STATE_FIPS[state.upper()]
     if as_of is None:
         as_of = latest_release()

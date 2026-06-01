@@ -1,11 +1,11 @@
 # Data sources
 
-Validated state as of May 2026. Re-verify before assuming any of this is current.
+Validated state as of June 2026. Re-verify before assuming any of this is current.
 
 ## FCC Broadband Data Collection (BDC)
 
 - **URL:** https://broadbandmap.fcc.gov/data-download
-- **Latest release:** Dec 2024 as-of, released May 12 2025, revised Jun 10 2025.
+- **Latest release:** Dec 2025 as-of (auto-discovered via `/listAsOfDates`; FCC publishes biannually and revises listings between releases, so the app refreshes file IDs on a TTL and self-heals on 422 `file_id is invalid`).
 - **Granularity:** BSL (Broadband Serviceable Location) — we aggregate to tract.
 - **Format:** CSV by state/provider; also Shapefile/GeoPackage.
 - **Auth:** None for bulk. Free FCC account for the Public Data API.
